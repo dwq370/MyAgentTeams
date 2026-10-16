@@ -1,0 +1,101 @@
+# 各自独立的容器。在仓库根目录执行：
+# docker compose up --build
+# Web http://localhost:8080  API http://localhost:3000  Worker http://localhost:3001
+# Postgres localhost:5432  Redis localhost:6379
+
+services:
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: agentteam
+      POSTGRES_PASSWORD: agentteam
+      POSTGRES_DB: agentteam
+    ports:
+      - "5432:5432"
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U agentteam -d agentteam"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+
+  redis:
+    image: redis:7-alpine
+    command: ["redis-server", "--appendonly", "yes"]
+    ports:
+      - "6379:6379"
+    volumes:
+      - redisdata:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+
+  backend:
+    build: ./backend
+    image: agentteam-backend:local
+    environment:
+      PROCESS_ROLE: api
+      PORT: 3000
+      DATABASE_URL: postgres://agentteam:agentteam@postgres:5432/agentteam
+      REDIS_URL: redis://redis:6379
+      JWT_SECRET: dev-only-jwt-secret
+      APP_ENCRYPTION_KEY: dev-only-change-me-please-32b
+      KUBECONFIG: /root/.kube/config
+    volumes:
+      - ${USERPROFILE}/.kube:/root/.kube:ro
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+      - "kubernetes.docker.internal:host-gateway"
+    ports:
+      - "3000:3000"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "node", "-e", "fetch('http://127.0.0.1:3000/api/health').then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))"]
+      interval: 5s
+      timeout: 5s
+      retries: 30
+      start_period: 20s
+
+  worker:
+    image: agentteam-backend:local
+    pull_policy: never
+    command: ["node", "dist/worker.js"]
+    environment:
+      PROCESS_ROLE: worker
+      WORKER_PORT: 3001
+      DATABASE_URL: postgres://agentteam:agentteam@postgres:5432/agentteam
+      REDIS_URL: redis://redis:6379
+      JWT_SECRET: dev-only-jwt-secret
+      APP_ENCRYPTION_KEY: dev-only-change-me-please-32b
+    ports:
+      - "3001:3001"
+    depends_on:
+      backend:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "node", "-e", "fetch('http://127.0.0.1:3001/api/health').then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+      start_period: 15s
+
+  frontend:
+    build: ./frontend
+    environment:
+      API_UPSTREAM: http://backend:3000
+    ports:
+      - "8080:80"
+    depends_on:
+      backend:
+        condition: service_healthy
+
+volumes:
+  pgdata:
+  redisdata:
