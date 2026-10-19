@@ -198,7 +198,8 @@ export interface MemberItem {
   failureReason: string | null;
   testedServiceVersionId: string | null;
   serviceIds: string[];
-  services: { id: string; name: string }[];
+  services: { id: string; name: string; repoUrl: string }[];
+  contacts: { id: string; name: string; memberType: "human" | "agent"; roleName: string }[];
   agent: null | {
     id: string;
     platform: string;
@@ -214,8 +215,73 @@ export interface MemberItem {
       baselineRef: string;
       forked: boolean;
       forkStatus: string;
+      branchOrigin?: "baseline" | "created" | "selected";
     }[];
   };
+}
+
+export interface UsageSnapshot {
+  inputTokens: number;
+  outputTokens: number;
+  cacheReadTokens: number;
+  cacheWriteTokens: number;
+  totalTokens: number;
+  reasoningTokens: number;
+  rawCostCents: number | null;
+  chargedCents: number | null;
+}
+
+export interface MonitorTask {
+  id: string;
+  title: string;
+  description: string;
+  status: "open" | "in_progress" | "done";
+  updatedAt: string;
+}
+
+export interface MonitorSession {
+  id: string;
+  workItemId: string | null;
+  prompt: string;
+  status: "queued" | "running" | "finished" | "error" | "startup_error" | "cancelled";
+  errorMessage: string | null;
+  externalRunId: string | null;
+  createdAt: string;
+  finishedAt: string | null;
+  durationMs: number | null;
+  logPreview: string;
+  usage: UsageSnapshot | null;
+}
+
+export interface MonitorMember {
+  id: string;
+  name: string;
+  memberType: "human" | "agent";
+  roleName: string;
+  status: "pending" | "active" | "failed";
+  failureReason: string | null;
+  activity: "creating" | "failed" | "working" | "idle";
+  model: string | null;
+  currentTasks: MonitorTask[];
+  currentSession: MonitorSession | null;
+  processedTasks: MonitorTask[];
+  sessions: MonitorSession[];
+  usage: UsageSnapshot | null;
+  usageNote: string | null;
+}
+
+export interface TeamMonitor {
+  teamId: string;
+  teamName: string;
+  summary: {
+    members: number;
+    working: number;
+    doneTasks: number;
+    sessions: number;
+    totalTokens: number;
+    chargedCents: number | null;
+  };
+  members: MonitorMember[];
 }
 
 export interface VersionItem {

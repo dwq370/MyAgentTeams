@@ -125,7 +125,7 @@ export class AgentsService {
   async sync(userId: string, agentId: string) {
     const context = await this.loadContext(userId, agentId);
     const results = [];
-    for (const workspace of context.workspaces.filter((item) => item.forked && item.forkStatus === "ready")) {
+    for (const workspace of context.workspaces.filter((item) => item.branchOrigin === "created" && item.forkStatus === "ready")) {
       const outcome = await this.git.syncBranch(workspace.serviceId, workspace.repoUrl, workspace.branch, workspace.baselineRef);
       results.push({ workspaceId: workspace.id, branch: workspace.branch, outcome });
     }

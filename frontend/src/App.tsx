@@ -6,6 +6,8 @@ import { EnginesPage } from "./EnginesPage";
 import { ProjectPage } from "./ProjectPage";
 import { ProjectsPage } from "./ProjectsPage";
 import { RolesPage } from "./RolesPage";
+import { TeamEntryPage } from "./TeamEntryPage";
+import { TeamMonitorPage } from "./TeamMonitorPage";
 import { TeamPage } from "./TeamPage";
 
 export function App() {
@@ -34,6 +36,8 @@ export function App() {
         <Route path="/engines" element={<EnginesPage />} />
         <Route path="/roles" element={<RolesPage />} />
         <Route path="/projects/:projectId" element={<ProjectPage />} />
+        <Route path="/projects/:projectId/teams/:teamId/monitor" element={<TeamMonitorPage />} />
+        <Route path="/projects/:projectId/teams/:teamId/entry" element={<TeamEntryPage />} />
         <Route path="/projects/:projectId/teams/:teamId" element={<TeamPage />} />
       </Route>
     </Routes>
@@ -42,20 +46,35 @@ export function App() {
 
 function Shell({ user, onLogout }: { user: User; onLogout: () => void }) {
   const navigate = useNavigate();
+  const [navOpen, setNavOpen] = useState(() => localStorage.getItem("agentteam.nav") !== "hidden");
+
+  function toggleNav() {
+    setNavOpen((current) => {
+      const next = !current;
+      localStorage.setItem("agentteam.nav", next ? "open" : "hidden");
+      return next;
+    });
+  }
 
   return (
-    <div className="app">
-      <aside className="sidebar">
-        <div className="brand">AgentTeam<span>人和 Agent 一起交付</span></div>
-        <nav>
-          <NavLink className="side-link" to="/" end>项目</NavLink>
-          <NavLink className="side-link" to="/engines">Agent引擎</NavLink>
-          <NavLink className="side-link" to="/roles">角色</NavLink>
-        </nav>
-        <div className="muted">{user.name}</div>
-        <button className="side-button" onClick={() => { onLogout(); navigate("/login"); }}>退出</button>
-      </aside>
-      <main className="main">
+    <div className={navOpen ? "app" : "app nav-collapsed"}>
+      {navOpen && (
+        <aside className="sidebar">
+          <div className="sidebar-head">
+            <div className="brand">AgentTeam<span>人和 Agent 一起交付</span></div>
+            <button className="side-button" type="button" onClick={toggleNav}>收起</button>
+          </div>
+          <nav>
+            <NavLink className="side-link" to="/" end>项目</NavLink>
+            <NavLink className="side-link" to="/engines">Agent引擎</NavLink>
+            <NavLink className="side-link" to="/roles">角色</NavLink>
+          </nav>
+          <div className="muted">{user.name}</div>
+          <button className="side-button" onClick={() => { onLogout(); navigate("/login"); }}>退出</button>
+        </aside>
+      )}
+      <main className={navOpen ? "main" : "main nav-collapsed-main"}>
+        {!navOpen && <button className="btn nav-open-button" type="button" onClick={toggleNav}>导航</button>}
         <Outlet />
       </main>
     </div>

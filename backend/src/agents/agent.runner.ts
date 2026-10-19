@@ -82,7 +82,7 @@ export class AgentJobRunner implements OnModuleInit, OnModuleDestroy {
     const created: AgentWorkspaceEntity[] = [];
     try {
       const secrets = await this.engines.secretsForProject(team.projectId);
-      const forked = rows.filter((row) => row.forked);
+      const forked = rows.filter((row) => row.branchOrigin === "created" && row.forkStatus === "planned");
       if (!secrets.selected) throw new Error("项目未选择 Agent 引擎");
       if (!secrets.apiKey) throw new Error("未配置 Cursor API Key");
       for (const workspace of forked) {
@@ -220,12 +220,13 @@ export class AgentJobRunner implements OnModuleInit, OnModuleDestroy {
         await this.publish(run.id, { type: "append", text: outcome.text });
       }
     }
-    if (outcome.kind === "finished") await this.finishRun(run, "finished", null, null);
-    else if (outcome.kind === "cancelled") await this.finishRun(run, "cancelled", null, null);
-    else if (outcome.kind === "run_error") await this.finishRun(run, "error", "run", outcome.message || "运行失败");
+    const measured = { durationMs: outcome.durationMs ?? null, usage: outcome.usage ?? null };
+    if (outcome.kind === "finished") await this.finishRun(run, "finished", null, null, measured);
+    else if (outcome.kind === "cancelled") await this.finishRun(run, "cancelled", null, null, measured);
+    else if (outcome.kind === "run_error") await this.finishRun(run, "error", "run", outcome.message || "运行失败", measured);
     else {
       const message = [outcome.message || "Cursor 启动失败", outcome.helpUrl].filter(Boolean).join(" ");
-      await this.finishRun(run, "startup_error", "startup", message);
+      await this.finishRun(run, "startup_error", "startup", message, measured);
     }
   }
 
@@ -234,8 +235,16 @@ export class AgentJobRunner implements OnModuleInit, OnModuleDestroy {
     status: AgentRunEntity["status"],
     errorCategory: AgentRunEntity["errorCategory"],
     errorMessage: string | null,
+    measured?: { durationMs: number | null; usage: AgentRunEntity["usage"] },
   ) {
-    await this.runs.update(run.id, { status, errorCategory, errorMessage, finishedAt: new Date() });
+    await this.runs.update(run.id, {
+      status,
+      errorCategory,
+      errorMessage,
+      finishedAt: new Date(),
+      durationMs: measured?.durationMs ?? null,
+      usage: measured?.usage ?? null,
+    });
     await this.publish(run.id, { type: "status", status, errorMessage });
   }
 

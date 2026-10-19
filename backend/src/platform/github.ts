@@ -76,6 +76,21 @@ export class GitHubClient {
     return { name, repos };
   }
 
+  async listBranches(token: string, repoUrl: string): Promise<string[]> {
+    const repo = this.repo(repoUrl);
+    const names: string[] = [];
+    for (let page = 1; page <= 5; page += 1) {
+      const response = await this.request(token, `/repos/${repo.owner}/${repo.repo}/branches?per_page=100&page=${page}`);
+      if (response.status === 401 || response.status === 403) throw new DomainError("Git 访问令牌无权读取分支", 400);
+      if (!response.ok) throw new DomainError(await this.errorText(response, "读取分支失败"));
+      const rows = (await response.json()) as { name?: string }[];
+      if (!Array.isArray(rows)) throw new DomainError("代码仓返回的分支列表无法识别");
+      for (const row of rows) if (row.name) names.push(row.name);
+      if (rows.length < 100) break;
+    }
+    return names;
+  }
+
   async ensureBranch(token: string, repoUrl: string, baseline: string, branch: string) {
     const repo = this.repo(repoUrl);
     const baseSha = await this.resolveRef(token, repo, baseline);

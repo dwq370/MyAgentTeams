@@ -5,24 +5,17 @@ import {
   api,
   errorText,
   Project,
-  ReleaseItem,
-  ServiceItem,
   TeamItem,
   KubernetesProbe,
   SshProbeResult,
   TestEnvironment,
-  VersionItem,
-  VERSION_LABELS,
 } from "./api";
 import { roleLabel } from "./ProjectsPage";
+import { TeamMonitorView } from "./TeamMonitorPage";
 
 export const PROJECT_SECTIONS = [
   { id: "overview", label: "概览" },
-  { id: "environments", label: "测试环境" },
   { id: "teams", label: "Team" },
-  { id: "members", label: "成员" },
-  { id: "engine", label: "选用引擎" },
-  { id: "releases", label: "系统版本" },
 ] as const;
 
 export type ProjectSection = (typeof PROJECT_SECTIONS)[number]["id"];
@@ -69,30 +62,99 @@ export function ProjectPage() {
           <button key={item.id} className={section === item.id ? "active" : ""} onClick={() => openSection(item.id)}>{item.label}</button>
         ))}
       </div>
-      {section === "overview" && <Overview project={project} onOpen={openSection} />}
-      {section === "environments" && <Environments projectId={projectId} manager={manager} />}
+      {section === "overview" && <Overview project={project} projectId={projectId} manager={manager} owner={owner} onSaved={load} />}
       {section === "teams" && <Teams projectId={projectId} manager={manager} />}
-      {section === "members" && <People projectId={projectId} manager={manager} />}
-      {section === "engine" && <EngineChoice project={project} projectId={projectId} owner={owner} onSaved={load} />}
-      {section === "releases" && <Releases projectId={projectId} />}
     </div>
   );
 }
 
-function Overview({ project, onOpen }: { project: Project; onOpen: (section: ProjectSection) => void }) {
-  const steps: { done: boolean; label: string; section: ProjectSection; action: string }[] = [
-    { done: Boolean(project.agentEngine), label: "选择 Agent 引擎", section: "engine", action: "去选择" },
-    { done: (project.counts?.environments ?? 0) > 0, label: "配置测试环境", section: "environments", action: "去配置" },
-    { done: (project.counts?.teams ?? 0) > 0, label: "创建 Team 并圈定工作区", section: "teams", action: "去创建" },
+function isSetupComplete(project: Project) {
+  return Boolean(project.agentEngine) && (project.counts?.environments ?? 0) > 0 && (project.counts?.teams ?? 0) > 0;
+}
+
+function firstIncomplete(project: Project) {
+  if (!project.agentEngine) return 0;
+  if ((project.counts?.environments ?? 0) === 0) return 1;
+  return 2;
+}
+
+function Overview({ project, projectId, manager, owner, onSaved }: { project: Project; projectId: string; manager: boolean; owner: boolean; onSaved: () => Promise<void> }) {
+  const complete = isSetupComplete(project);
+  const [step, setStep] = useState(firstIncomplete(project));
+  const [trackedId, setTrackedId] = useState(project.id);
+  const [finished, setFinished] = useState(complete);
+  const switching = trackedId !== project.id;
+  if (switching) {
+    setTrackedId(project.id);
+    setFinished(complete);
+    setStep(firstIncomplete(project));
+  } else if (complete && !finished) {
+    setFinished(true);
+  }
+  if (switching ? complete : finished || complete) {
+    return <ProjectHome project={project} projectId={projectId} manager={manager} owner={owner} onSaved={onSaved} />;
+  }
+  return <SetupWizard project={project} projectId={projectId} manager={manager} owner={owner} step={step} onStep={setStep} onSaved={onSaved} />;
+}
+
+function SetupWizard({ project, projectId, manager, owner, step, onStep, onSaved }: { project: Project; projectId: string; manager: boolean; owner: boolean; step: number; onStep: (step: number) => void; onSaved: () => Promise<void> }) {
+  const steps = [
+    { title: "选择 Agent 引擎", done: Boolean(project.agentEngine) },
+    { title: "配置测试环境", done: (project.counts?.environments ?? 0) > 0 },
+    { title: "创建 Team", done: (project.counts?.teams ?? 0) > 0 },
   ];
+
+  function open(index: number) {
+    if (index <= step || steps.slice(0, index).every((item) => item.done)) onStep(index);
+  }
+
   return (
-    <div className="card stack">
-      {steps.map((step) => (
-        <div className="step-row" key={step.label}>
-          <div><span className={step.done ? "pill good" : "pill wait"}>{step.done ? "已完成" : "待做"}</span> {step.label}</div>
-          <button className="btn" onClick={() => onOpen(step.section)}>{step.done ? "查看" : step.action}</button>
+    <div className="stack">
+      <p className="muted">按顺序完成创建。完成后，概览会集中显示 Agent 引擎、测试环境和 Team 监控。</p>
+      <div className="tabs">
+        {steps.map((item, index) => (
+          <button key={item.title} type="button" className={index === step ? "active" : ""} disabled={index > step && !steps.slice(0, index).every((entry) => entry.done)} onClick={() => open(index)}>
+            {index + 1}. {item.title}{item.done ? " · 已完成" : ""}
+          </button>
+        ))}
+      </div>
+      {step === 0 && <EngineChoice project={project} projectId={projectId} owner={owner} onSaved={onSaved} />}
+      {step === 1 && <Environments projectId={projectId} manager={manager} onChanged={onSaved} />}
+      {step === 2 && (
+        <div className="stack">
+          <p className="muted">创建 Team 后进入概览。代码来源可以之后在 Team 里配置。</p>
+          <Teams projectId={projectId} manager={manager} onChanged={onSaved} />
         </div>
-      ))}
+      )}
+      <div className="row">
+        <button className="btn" type="button" disabled={step === 0} onClick={() => onStep(step - 1)}>上一步</button>
+        {step < 2 && <button className="btn primary" type="button" disabled={!steps[step].done} onClick={() => onStep(step + 1)}>下一步</button>}
+      </div>
+    </div>
+  );
+}
+
+function ProjectHome({ project, projectId, manager, owner, onSaved }: { project: Project; projectId: string; manager: boolean; owner: boolean; onSaved: () => Promise<void> }) {
+  const [teams, setTeams] = useState<TeamItem[]>([]);
+  const [error, setError] = useState("");
+
+  useEffect(() => {
+    api<TeamItem[]>(`/api/projects/${projectId}/teams`).then(setTeams).catch((reason) => setError(errorText(reason)));
+  }, [projectId, project.counts?.teams]);
+
+  return (
+    <div className="stack">
+      <EngineChoice project={project} projectId={projectId} owner={owner} onSaved={onSaved} />
+      <div className="stack">
+        <h2>测试环境</h2>
+        <Environments projectId={projectId} manager={manager} onChanged={onSaved} />
+      </div>
+      <div className="stack">
+        <h2>Team 监控</h2>
+        {error && <div className="alert">{error}</div>}
+        {teams.map((team) => <TeamMonitorView key={team.id} projectId={projectId} teamId={team.id} embedded />)}
+        {teams.length === 0 && <p className="muted">还没有 Team。</p>}
+      </div>
     </div>
   );
 }
@@ -105,7 +167,7 @@ function environmentSummary(item: TestEnvironment) {
   return `单机 · ${item.sshUsername ?? ""}@${item.sshHost ?? ""}:${item.sshPort ?? 22}`;
 }
 
-function Environments({ projectId, manager }: { projectId: string; manager: boolean }) {
+function Environments({ projectId, manager, onChanged }: { projectId: string; manager: boolean; onChanged?: () => Promise<void> }) {
   const [items, setItems] = useState<TestEnvironment[]>([]);
   const [editing, setEditing] = useState<TestEnvironment | null>(null);
   const [name, setName] = useState("");
@@ -191,6 +253,7 @@ function Environments({ projectId, manager }: { projectId: string; manager: bool
       else await api(`/api/projects/${projectId}/environments`, { method: "POST", body: JSON.stringify(body) });
       beginCreate();
       await load();
+      await onChanged?.();
     } catch (reason) { setError(errorText(reason)); }
   }
 
@@ -201,6 +264,7 @@ function Environments({ projectId, manager }: { projectId: string; manager: bool
       await api(`/api/projects/${projectId}/environments/${item.id}`, { method: "DELETE" });
       if (editing?.id === item.id) beginCreate();
       await load();
+      await onChanged?.();
     } catch (reason) { setError(errorText(reason)); }
   }
 
@@ -291,85 +355,65 @@ function Environments({ projectId, manager }: { projectId: string; manager: bool
   );
 }
 
-function Teams({ projectId, manager }: { projectId: string; manager: boolean }) {
+function Teams({ projectId, manager, onChanged }: { projectId: string; manager: boolean; onChanged?: () => Promise<void> }) {
   const [items, setItems] = useState<TeamItem[]>([]);
+  const [creating, setCreating] = useState(false);
   const [name, setName] = useState("");
   const [description, setDescription] = useState("");
   const [error, setError] = useState("");
   async function load() { setItems(await api<TeamItem[]>(`/api/projects/${projectId}/teams`)); }
   useEffect(() => { load().catch((reason) => setError(errorText(reason))); }, [projectId]);
 
+  function openCreate() {
+    setName("");
+    setDescription("");
+    setError("");
+    setCreating(true);
+  }
+
   async function create(event: FormEvent) {
     event.preventDefault();
     try {
       await api(`/api/projects/${projectId}/teams`, { method: "POST", body: JSON.stringify({ name, description }) });
-      setName(""); setDescription(""); await load();
+      setCreating(false);
+      setName("");
+      setDescription("");
+      await load();
+      await onChanged?.();
     } catch (reason) { setError(errorText(reason)); }
   }
 
   return (
-    <div className="grid-2">
+    <div className="stack">
+      <div className="toprow">
+        <p className="muted">打开入口后可以选择 Agent 对话。</p>
+        {manager && <button className="btn primary" type="button" onClick={openCreate}>创建 Team</button>}
+      </div>
       <div className="list">
         {items.map((team) => (
-          <Link key={team.id} className="card project-row" to={`/projects/${projectId}/teams/${team.id}`}>
-            <strong>{team.name}</strong>
-            <span className="muted">{team.description}</span>
-          </Link>
+          <div key={team.id} className="card project-row">
+            <Link className="project-main" to={`/projects/${projectId}/teams/${team.id}`}>
+              <strong>{team.name}</strong>
+              <span className="muted">{team.description}</span>
+            </Link>
+            <Link className="btn primary" to={`/projects/${projectId}/teams/${team.id}/entry`}>入口</Link>
+          </div>
         ))}
+        {items.length === 0 && <div className="card muted">还没有 Team。</div>}
       </div>
-      {manager && (
-        <form className="card form" onSubmit={create}>
-          <h2>创建 Team</h2>
-          <label>名称<input value={name} onChange={(event) => setName(event.target.value)} required /></label>
-          <label>说明<textarea value={description} onChange={(event) => setDescription(event.target.value)} /></label>
-          {error && <div className="alert">{error}</div>}
-          <button className="btn primary">创建</button>
-        </form>
-      )}
-    </div>
-  );
-}
-
-function People({ projectId, manager }: { projectId: string; manager: boolean }) {
-  const [items, setItems] = useState<{ userId: string; email: string; name: string; projectRole: string }[]>([]);
-  const [email, setEmail] = useState("");
-  const [projectRole, setProjectRole] = useState("member");
-  const [error, setError] = useState("");
-  async function load() {
-    setItems(await api<{ userId: string; email: string; name: string; projectRole: string }[]>(`/api/projects/${projectId}/members`));
-  }
-  useEffect(() => { load().catch((reason) => setError(errorText(reason))); }, [projectId]);
-  async function add(event: FormEvent) {
-    event.preventDefault();
-    try {
-      await api(`/api/projects/${projectId}/members`, { method: "POST", body: JSON.stringify({ email, projectRole }) });
-      setEmail(""); await load();
-    } catch (reason) { setError(errorText(reason)); }
-  }
-  return (
-    <div className="grid-2">
-      <div className="card">
-        <table>
-          <tbody>
-            {items.map((item) => (
-              <tr key={item.userId}><td>{item.name}<div className="meta">{item.email}</div></td><td>{roleLabel(item.projectRole)}</td></tr>
-            ))}
-          </tbody>
-        </table>
-      </div>
-      {manager && (
-        <form className="card form" onSubmit={add}>
-          <h2>加入项目</h2>
-          <label>邮箱<input type="email" value={email} onChange={(event) => setEmail(event.target.value)} required /></label>
-          <label>项目权限
-            <select value={projectRole} onChange={(event) => setProjectRole(event.target.value)}>
-              <option value="member">成员</option>
-              <option value="admin">管理员</option>
-            </select>
-          </label>
-          {error && <div className="alert">{error}</div>}
-          <button className="btn primary">添加</button>
-        </form>
+      {creating && (
+        <div className="modal-backdrop" onClick={() => setCreating(false)}>
+          <form className="card form modal" onClick={(event) => event.stopPropagation()} onSubmit={create}>
+            <h2>创建 Team</h2>
+            <label>名称<input value={name} onChange={(event) => setName(event.target.value)} required /></label>
+            <label>说明<textarea value={description} onChange={(event) => setDescription(event.target.value)} /></label>
+            {error && <div className="alert">{error}</div>}
+            <div className="row">
+              <button className="btn primary">创建</button>
+              <button className="btn" type="button" onClick={() => setCreating(false)}>取消</button>
+            </div>
+          </form>
+        </div>
       )}
     </div>
   );
@@ -438,91 +482,5 @@ function EngineChoice({ project, projectId, owner, onSaved }: { project: Project
       {ok && <div className="ok">{ok}</div>}
       {engines.length > 0 && <button className="btn primary">保存</button>}
     </form>
-  );
-}
-
-function Releases({ projectId }: { projectId: string }) {
-  const [teams, setTeams] = useState<TeamItem[]>([]);
-  const [teamId, setTeamId] = useState("");
-  const [versions, setVersions] = useState<VersionItem[]>([]);
-  const [services, setServices] = useState<ServiceItem[]>([]);
-  const [selected, setSelected] = useState<string[]>([]);
-  const [version, setVersion] = useState("");
-  const [releases, setReleases] = useState<ReleaseItem[]>([]);
-  const [error, setError] = useState("");
-
-  async function loadReleases() {
-    setReleases(await api<ReleaseItem[]>(`/api/projects/${projectId}/releases`));
-  }
-  useEffect(() => {
-    api<TeamItem[]>(`/api/projects/${projectId}/teams`).then(setTeams).catch((reason) => setError(errorText(reason)));
-    loadReleases().catch((reason) => setError(errorText(reason)));
-  }, [projectId]);
-
-  useEffect(() => {
-    if (!teamId) return;
-    api<{ services: ServiceItem[]; versions: VersionItem[] }>(`/api/teams/${teamId}/versions`)
-      .then((data) => { setServices(data.services); setVersions(data.versions.filter((item) => item.status === "passed")); })
-      .catch((reason) => setError(errorText(reason)));
-  }, [teamId]);
-
-  function toggle(id: string) {
-    setSelected((current) => current.includes(id) ? current.filter((item) => item !== id) : [...current, id]);
-  }
-
-  async function create(event: FormEvent) {
-    event.preventDefault();
-    setError("");
-    try {
-      const release = await api<ReleaseItem>(`/api/projects/${projectId}/releases`, {
-        method: "POST",
-        body: JSON.stringify({
-          teamId,
-          version,
-          items: selected.map((serviceVersionId) => ({
-            serviceVersionId,
-            serviceId: versions.find((item) => item.id === serviceVersionId)?.serviceId,
-          })),
-        }),
-      });
-      await api(`/api/system-releases/${release.id}/publish`, { method: "POST" });
-      setVersion(""); setSelected([]);
-      await loadReleases();
-    } catch (reason) { setError(errorText(reason)); }
-  }
-
-  return (
-    <div className="grid-2">
-      <div className="card">
-        <h2>已发布</h2>
-        {releases.map((release) => (
-          <div key={release.id} className="row">
-            <strong>{release.version}</strong>
-            <span className="pill">{release.status === "published" ? "已发布" : "草稿"}</span>
-            <span className="meta">{release.items.length} 个服务</span>
-          </div>
-        ))}
-      </div>
-      <form className="card form" onSubmit={create}>
-        <h2>组装系统版本</h2>
-        <label>Team
-          <select value={teamId} onChange={(event) => setTeamId(event.target.value)} required>
-            <option value="">选择</option>
-            {teams.map((team) => <option key={team.id} value={team.id}>{team.name}</option>)}
-          </select>
-        </label>
-        <label>系统版本号<input value={version} onChange={(event) => setVersion(event.target.value)} placeholder="1.0.0" required /></label>
-        <div className="checks">
-          {versions.map((item) => (
-            <label key={item.id}>
-              <input type="checkbox" checked={selected.includes(item.id)} onChange={() => toggle(item.id)} />
-              {services.find((service) => service.id === item.serviceId)?.name} {item.version} · {VERSION_LABELS[item.status]}
-            </label>
-          ))}
-        </div>
-        {error && <div className="alert">{error}</div>}
-        <button className="btn primary">发布</button>
-      </form>
-    </div>
   );
 }

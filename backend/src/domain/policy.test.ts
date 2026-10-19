@@ -12,6 +12,7 @@ import {
   parseGitRepo,
   roleDeletionBlock,
   tagNameForVersion,
+  memberBranchName,
   workspaceBranch,
 } from "./policy";
 import { DomainError } from "./errors";
@@ -54,6 +55,9 @@ describe("workspace and prompt", () => {
   it("builds a stable fork branch", () => {
     assert.equal(workspaceBranch("Order Dev", "12345678-aaaa-bbbb-cccc-ddddeeee", "order-service"), "agents/order-dev/order-service");
     assert.equal(tagNameForVersion("1.2.0"), "v1.2.0");
+    assert.equal(memberBranchName("epvs", "张三", "feature"), "agentteams-epvs/张三/feature");
+    assert.equal(memberBranchName("Order Dev", "SWE 1", "order service"), "agentteams-Order-Dev/SWE-1/order-service");
+    assert.throws(() => memberBranchName("epvs", "张三", ".."), DomainError);
   });
 
   it("maps the current role text into the next prompt", () => {

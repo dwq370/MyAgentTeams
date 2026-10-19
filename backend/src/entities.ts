@@ -448,8 +448,24 @@ export class AgentWorkspaceEntity {
   @Column({ name: "fork_status" })
   forkStatus: "planned" | "ready" | "failed";
 
+  @Column({ name: "branch_origin", default: "baseline" })
+  branchOrigin: "baseline" | "created" | "selected";
+
   @Column({ name: "git_sha", type: "varchar", nullable: true })
   gitSha: string | null;
+}
+
+@Entity("member_contact")
+@Index(["memberId", "peerMemberId"], { unique: true })
+export class MemberContactEntity {
+  @PrimaryGeneratedColumn("uuid")
+  id: string;
+
+  @Column({ name: "member_id", type: "uuid" })
+  memberId: string;
+
+  @Column({ name: "peer_member_id", type: "uuid" })
+  peerMemberId: string;
 }
 
 @Entity("member_service")
@@ -498,6 +514,17 @@ export class WorkItemEntity {
   updatedAt: Date;
 }
 
+export interface RunUsageSnapshot {
+  inputTokens: number;
+  outputTokens: number;
+  cacheReadTokens: number;
+  cacheWriteTokens: number;
+  totalTokens: number;
+  reasoningTokens: number;
+  rawCostCents: number | null;
+  chargedCents: number | null;
+}
+
 @Entity("agent_run")
 export class AgentRunEntity {
   @PrimaryGeneratedColumn("uuid")
@@ -532,6 +559,12 @@ export class AgentRunEntity {
 
   @Column({ type: "text", default: "" })
   log: string;
+
+  @Column({ type: "jsonb", nullable: true })
+  usage: RunUsageSnapshot | null;
+
+  @Column({ name: "duration_ms", type: "int", nullable: true })
+  durationMs: number | null;
 
   @CreateDateColumn({ name: "created_at", type: "timestamptz" })
   createdAt: Date;
@@ -621,6 +654,7 @@ export const ALL_ENTITIES = [
   TeamMemberEntity,
   AgentEntity,
   AgentWorkspaceEntity,
+  MemberContactEntity,
   MemberServiceEntity,
   WorkItemEntity,
   AgentRunEntity,

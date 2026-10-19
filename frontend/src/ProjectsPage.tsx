@@ -1,5 +1,5 @@
 import { FormEvent, useEffect, useState } from "react";
-import { Link } from "react-router-dom";
+import { Link, useNavigate } from "react-router-dom";
 import { api, errorText, Project } from "./api";
 
 export function ProjectsPage() {
@@ -9,6 +9,7 @@ export function ProjectsPage() {
   const [name, setName] = useState("");
   const [description, setDescription] = useState("");
   const [error, setError] = useState("");
+  const navigate = useNavigate();
 
   async function load() {
     setProjects(await api<Project[]>("/api/projects"));
@@ -47,11 +48,13 @@ export function ProjectsPage() {
     try {
       if (editing) {
         await api(`/api/projects/${editing.id}`, { method: "PATCH", body: JSON.stringify({ name, description }) });
+        closeForm();
+        await load();
       } else {
-        await api("/api/projects", { method: "POST", body: JSON.stringify({ name, description }) });
+        const created = await api<Project>("/api/projects", { method: "POST", body: JSON.stringify({ name, description }) });
+        closeForm();
+        navigate(`/projects/${created.id}`);
       }
-      closeForm();
-      await load();
     } catch (reason) {
       setError(errorText(reason));
     }

@@ -1,4 +1,4 @@
-import { Body, Controller, Delete, Get, Param, Patch, Post, Put } from "@nestjs/common";
+import { Body, Controller, Delete, Get, Param, Patch, Post, Put, Query } from "@nestjs/common";
 import { AuthUser, CurrentUser } from "../common/auth";
 import {
   AgentMemberDto,
@@ -7,6 +7,8 @@ import {
   CreateWorkItemDto,
   HumanMemberDto,
   ReplaceWorkspacesDto,
+  ReplaceMemberReposDto,
+  UpdateContactsDto,
   UpdateMemberDto,
   UpdateTeamDto,
   UpdateWorkItemDto,
@@ -25,6 +27,11 @@ export class TeamsController {
   @Post("projects/:projectId/teams")
   create(@CurrentUser() user: AuthUser, @Param("projectId") projectId: string, @Body() body: CreateTeamDto) {
     return this.teams.create(user.id, projectId, body);
+  }
+
+  @Get("teams/:teamId/monitor")
+  monitor(@CurrentUser() user: AuthUser, @Param("teamId") teamId: string) {
+    return this.teams.monitor(user.id, teamId);
   }
 
   @Get("teams/:teamId")
@@ -84,6 +91,17 @@ export class TeamsController {
     return this.teams.replaceWorkspaces(user.id, teamId, body.items);
   }
 
+  @Get("teams/:teamId/branches")
+  branches(
+    @CurrentUser() user: AuthUser,
+    @Param("teamId") teamId: string,
+    @Query("serviceId") serviceId?: string,
+    @Query("sourceId") sourceId?: string,
+    @Query("repoUrl") repoUrl?: string,
+  ) {
+    return this.teams.listRepoBranches(user.id, teamId, { serviceId, sourceId, repoUrl });
+  }
+
   @Get("teams/:teamId/members")
   members(@CurrentUser() user: AuthUser, @Param("teamId") teamId: string) {
     return this.teams.listMembers(user.id, teamId);
@@ -109,13 +127,44 @@ export class TeamsController {
     return this.teams.updateMember(user.id, teamId, memberId, body);
   }
 
+  @Put("teams/:teamId/members/:memberId/repos")
+  replaceRepos(
+    @CurrentUser() user: AuthUser,
+    @Param("teamId") teamId: string,
+    @Param("memberId") memberId: string,
+    @Body() body: ReplaceMemberReposDto,
+  ) {
+    return this.teams.replaceMemberRepos(user.id, teamId, memberId, body);
+  }
+
+  @Put("teams/:teamId/members/:memberId/contacts")
+  updateContacts(
+    @CurrentUser() user: AuthUser,
+    @Param("teamId") teamId: string,
+    @Param("memberId") memberId: string,
+    @Body() body: UpdateContactsDto,
+  ) {
+    return this.teams.updateContacts(user.id, teamId, memberId, body.memberIds);
+  }
+
+  @Delete("teams/:teamId/members/:memberId/workspaces/:workspaceId/branch")
+  deleteBranch(
+    @CurrentUser() user: AuthUser,
+    @Param("teamId") teamId: string,
+    @Param("memberId") memberId: string,
+    @Param("workspaceId") workspaceId: string,
+  ) {
+    return this.teams.deleteMemberBranch(user.id, teamId, memberId, workspaceId);
+  }
+
   @Delete("teams/:teamId/members/:memberId")
   removeMember(
     @CurrentUser() user: AuthUser,
     @Param("teamId") teamId: string,
     @Param("memberId") memberId: string,
+    @Query("deleteBranches") deleteBranches?: string,
   ) {
-    return this.teams.removeMember(user.id, teamId, memberId);
+    return this.teams.removeMember(user.id, teamId, memberId, deleteBranches === "true");
   }
 
   @Post("agents/:agentId/retry")

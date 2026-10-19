@@ -17,6 +17,51 @@ import {
   VERSION_LABELS,
 } from "./api";
 
+function branchSegment(raw: string) {
+  return raw.trim().replace(/[\s/]+/g, "-").replace(/-+/g, "-").replace(/^-+|-+$/g, "");
+}
+
+function previewBranch(teamName: string, memberName: string, leaf: string) {
+  return `agentteams-${branchSegment(teamName) || "团队"}/${branchSegment(memberName) || "成员名"}/${branchSegment(leaf) || "名称"}`;
+}
+
+function separateBranch(workspace: { branchOrigin?: string }) {
+  return workspace.branchOrigin === "created" || workspace.branchOrigin === "selected";
+}
+
+type RepoLine = { action: string; name: string; repoUrl: string; branch: string };
+
+function RepoConfirmDialog({ title, lines, saving, error, onCancel, onConfirm }: {
+  title: string;
+  lines: RepoLine[];
+  saving: boolean;
+  error: string;
+  onCancel: () => void;
+  onConfirm: () => void;
+}) {
+  return (
+    <div className="modal-backdrop" onClick={(event) => { event.stopPropagation(); if (!saving) onCancel(); }}>
+      <form className="card form modal" onClick={(event) => event.stopPropagation()} onSubmit={(event) => { event.preventDefault(); onConfirm(); }}>
+        <h2>{title}</h2>
+        <div className="list">
+          {lines.map((line) => (
+            <div key={`${line.action}-${line.repoUrl}-${line.branch}`}>
+              <strong>{line.action} · {line.name}</strong>
+              <div className="meta">{line.repoUrl}</div>
+              <div className="meta">分支 {line.branch}</div>
+            </div>
+          ))}
+        </div>
+        {error && <div className="alert">{error}</div>}
+        <div className="row">
+          <button className="btn primary" disabled={saving}>确认</button>
+          <button className="btn" type="button" disabled={saving} onClick={onCancel}>取消</button>
+        </div>
+      </form>
+    </div>
+  );
+}
+
 export function TeamPage() {
   const { projectId = "", teamId = "" } = useParams();
   const [tab, setTab] = useState("工作区");
@@ -37,7 +82,10 @@ export function TeamPage() {
   return (
     <div className="stack">
       <div>
-        <Link to={`/projects/${projectId}`}>返回项目</Link>
+        <div className="toprow">
+          <Link to={`/projects/${projectId}`}>返回项目</Link>
+          <Link className="btn primary" to={`/projects/${projectId}/teams/${teamId}/entry`}>入口</Link>
+        </div>
         <h1>{team.name}</h1>
         <p className="muted">{team.description || "暂无说明"}{team.myMembership ? ` · 我的角色 ${team.myMembership.roleName}` : ""}</p>
       </div>
@@ -46,9 +94,10 @@ export function TeamPage() {
         {["工作区", "成员", "工作项", "版本"].map((item) => (
           <button key={item} className={tab === item ? "active" : ""} onClick={() => setTab(item)}>{item}</button>
         ))}
+        <Link className="btn primary" to={`/projects/${projectId}/teams/${teamId}/entry`}>入口</Link>
       </div>
       {tab === "工作区" && <Workspaces team={team} projectId={projectId} manager={manager} onSaved={loadTeam} />}
-      {tab === "成员" && <Members teamId={teamId} projectId={projectId} manager={manager} onTeamChanged={loadTeam} />}
+      {tab === "成员" && <Members teamId={teamId} teamName={team.name} projectId={projectId} manager={manager} onTeamChanged={loadTeam} />}
       {tab === "工作项" && <WorkItems teamId={teamId} />}
       {tab === "版本" && <Versions team={team} />}
     </div>
@@ -160,7 +209,7 @@ function Workspaces({ team, projectId, manager, onSaved }: { team: TeamItem; pro
     <form className="card form" onSubmit={saveEnvironment}>
       <h2>测试环境</h2>
       {environments.length === 0 ? (
-        <p>项目还没有测试环境。<Link to={`/projects/${projectId}?section=environments`}>去配置</Link></p>
+        <p>项目还没有测试环境。<Link to={`/projects/${projectId}`}>去概览配置</Link></p>
       ) : (
         <label>选用
           <select value={environmentId} onChange={(event) => setEnvironmentId(event.target.value)} disabled={!manager}>
@@ -248,7 +297,7 @@ function Workspaces({ team, projectId, manager, onSaved }: { team: TeamItem; pro
   );
 }
 
-function Members({ teamId, projectId, manager, onTeamChanged }: { teamId: string; projectId: string; manager: boolean; onTeamChanged: () => Promise<void> }) {
+function Members({ teamId, teamName, projectId, manager, onTeamChanged }: { teamId: string; teamName: string; projectId: string; manager: boolean; onTeamChanged: () => Promise<void> }) {
   const [members, setMembers] = useState<MemberItem[]>([]);
   const [roles, setRoles] = useState<RoleItem[]>([]);
   const [catalog, setCatalog] = useState<TeamCatalog | null>(null);
@@ -285,28 +334,131 @@ function Members({ teamId, projectId, manager, onTeamChanged }: { teamId: string
     <div className="stack">
       {error && <div className="alert">{error}</div>}
       {members.map((member) => (
-        <MemberCard key={member.id} member={member} teamId={teamId} versions={versions} onChanged={load} onError={setError} />
+        <MemberCard key={member.id} member={member} peers={members.filter((item) => item.id !== member.id)} teamId={teamId} teamName={teamName} catalog={catalog} versions={versions} manager={manager} onChanged={load} onError={setError} />
       ))}
-      {manager && <MemberForm teamId={teamId} roles={roles} catalog={catalog} versions={versions} onCreated={load} />}
+      {manager && <MemberForm teamId={teamId} teamName={teamName} members={members} roles={roles} catalog={catalog} versions={versions} onCreated={load} />}
     </div>
   );
 }
 
-function MemberCard({ member, teamId, versions, onChanged, onError }: {
+function MemberCard({ member, peers, teamId, teamName, catalog, versions, manager, onChanged, onError }: {
   member: MemberItem;
+  peers: MemberItem[];
   teamId: string;
+  teamName: string;
+  catalog: TeamCatalog | null;
   versions: VersionItem[];
+  manager: boolean;
   onChanged: () => Promise<void>;
   onError: (message: string) => void;
 }) {
   const [prompt, setPrompt] = useState("");
   const [preview, setPreview] = useState("");
   const [runId, setRunId] = useState("");
+  const [editing, setEditing] = useState(false);
+  const [name, setName] = useState(member.name);
+  const [duty, setDuty] = useState(member.dutyOverride);
+  const [editError, setEditError] = useState("");
+  const [saving, setSaving] = useState(false);
+  const [contactsOpen, setContactsOpen] = useState(false);
+  const [contactIds, setContactIds] = useState<string[]>([]);
+  const [contactError, setContactError] = useState("");
+  const [removing, setRemoving] = useState(false);
+  const [deleteBranches, setDeleteBranches] = useState(false);
+  const [removeError, setRemoveError] = useState("");
+  const [branchToDelete, setBranchToDelete] = useState("");
+  const [reposOpen, setReposOpen] = useState(false);
+  const ownedBranches = member.agent?.workspaces.filter(separateBranch) ?? [];
 
-  async function remove() {
-    if (!confirm(`移除 ${member.name}？`)) return;
-    try { await api(`/api/teams/${teamId}/members/${member.id}`, { method: "DELETE" }); await onChanged(); }
-    catch (reason) { onError(errorText(reason)); }
+  function openEdit() {
+    setName(member.name);
+    setDuty(member.dutyOverride);
+    setEditError("");
+    setEditing(true);
+  }
+
+  async function saveEdit(event: FormEvent) {
+    event.preventDefault();
+    const nextName = name.trim();
+    if (!nextName) {
+      setEditError("名称不能为空");
+      return;
+    }
+    setSaving(true);
+    setEditError("");
+    try {
+      await api(`/api/teams/${teamId}/members/${member.id}`, {
+        method: "PATCH",
+        body: JSON.stringify({ name: nextName, dutyOverride: duty }),
+      });
+      setEditing(false);
+      await onChanged();
+    } catch (reason) {
+      setEditError(errorText(reason));
+    } finally {
+      setSaving(false);
+    }
+  }
+
+  function openContacts() {
+    setContactIds(member.contacts.map((item) => item.id));
+    setContactError("");
+    setContactsOpen(true);
+  }
+
+  async function saveContacts(event: FormEvent) {
+    event.preventDefault();
+    setSaving(true);
+    setContactError("");
+    try {
+      await api(`/api/teams/${teamId}/members/${member.id}/contacts`, {
+        method: "PUT",
+        body: JSON.stringify({ memberIds: contactIds }),
+      });
+      setContactsOpen(false);
+      await onChanged();
+    } catch (reason) {
+      setContactError(errorText(reason));
+    } finally {
+      setSaving(false);
+    }
+  }
+
+  function openRemove() {
+    setDeleteBranches(false);
+    setRemoveError("");
+    setRemoving(true);
+  }
+
+  async function confirmRemove(event: FormEvent) {
+    event.preventDefault();
+    setSaving(true);
+    setRemoveError("");
+    try {
+      const drop = deleteBranches && ownedBranches.length > 0;
+      await api(`/api/teams/${teamId}/members/${member.id}?deleteBranches=${drop ? "true" : "false"}`, { method: "DELETE" });
+      setRemoving(false);
+      await onChanged();
+    } catch (reason) {
+      setRemoveError(errorText(reason));
+    } finally {
+      setSaving(false);
+    }
+  }
+
+  async function confirmDeleteBranch(event: FormEvent) {
+    event.preventDefault();
+    setSaving(true);
+    try {
+      await api(`/api/teams/${teamId}/members/${member.id}/workspaces/${branchToDelete}/branch`, { method: "DELETE" });
+      setBranchToDelete("");
+      await onChanged();
+    } catch (reason) {
+      onError(errorText(reason));
+      setBranchToDelete("");
+    } finally {
+      setSaving(false);
+    }
   }
   async function retry() {
     if (!member.agent) return;
@@ -347,19 +499,103 @@ function MemberCard({ member, teamId, versions, onChanged, onError }: {
         <span className={`pill ${statusClass}`}>{member.status}</span>
       </div>
       {member.failureReason && <div className="alert">{member.failureReason}</div>}
-      {member.dutyOverride && <p>{member.dutyOverride}</p>}
+      {member.dutyOverride && <p className="chat-text">{member.dutyOverride}</p>}
+      <p className="meta">可沟通：{member.contacts.length ? member.contacts.map((item) => item.name).join("、") : "未添加"}</p>
       {member.agent && (
         <div className="meta">
           {member.agent.platform} / {member.agent.model} / {member.agent.externalAgentId || "尚未创建外部 Agent"}
           {member.agent.workspaces.map((workspace) => (
-            <div key={workspace.id}>{workspace.forked ? "fork" : "基线"} {workspace.branch} · {workspace.forkStatus}</div>
+            <div key={workspace.id} className="split">
+              <span>{separateBranch(workspace) ? "分支" : "基线"} {workspace.branch} · {workspace.forkStatus === "planned" ? "创建中" : workspace.forkStatus === "failed" ? "失败" : "就绪"}</span>
+              {manager && separateBranch(workspace) && member.status !== "pending" && (
+                <button className="btn" type="button" onClick={() => setBranchToDelete(workspace.id)}>删除分支</button>
+              )}
+            </div>
           ))}
         </div>
       )}
       <div className="row">
-        <button className="btn danger" onClick={remove}>移除</button>
+        {manager && <button className="btn" type="button" onClick={openEdit}>编辑</button>}
+        {manager && needsServices(member.permissions) && (
+          <button className="btn" type="button" disabled={member.status === "pending"} onClick={() => setReposOpen(true)}>代码仓</button>
+        )}
+        {manager && <button className="btn" type="button" onClick={openContacts}>沟通</button>}
+        <button className="btn danger" type="button" onClick={openRemove}>移除</button>
         {member.agent && member.status === "failed" && <button className="btn" onClick={retry}>重试创建</button>}
       </div>
+      {editing && (
+        <div className="modal-backdrop" onClick={() => { if (!saving) setEditing(false); }}>
+          <form className="card form modal" onClick={(event) => event.stopPropagation()} onSubmit={saveEdit}>
+            <h2>编辑 {member.memberType === "agent" ? "Agent" : "成员"}</h2>
+            <label>名称<input value={name} onChange={(event) => setName(event.target.value)} required maxLength={80} /></label>
+            <label>职责描述<textarea value={duty} onChange={(event) => setDuty(event.target.value)} /></label>
+            {editError && <div className="alert">{editError}</div>}
+            <div className="row">
+              <button className="btn primary" disabled={saving}>保存</button>
+              <button className="btn" type="button" disabled={saving} onClick={() => setEditing(false)}>取消</button>
+            </div>
+          </form>
+        </div>
+      )}
+      {contactsOpen && (
+        <div className="modal-backdrop" onClick={() => { if (!saving) setContactsOpen(false); }}>
+          <form className="card form modal" onClick={(event) => event.stopPropagation()} onSubmit={saveContacts}>
+            <h2>可沟通成员</h2>
+            <p className="muted">{member.name} 可以和下面勾选的成员沟通。</p>
+            {peers.length === 0 && <p className="muted">Team 里还没有其他成员。</p>}
+            <div className="source-repos">
+              {peers.map((peer) => (
+                <label key={peer.id} className="check-line">
+                  <input
+                    type="checkbox"
+                    checked={contactIds.includes(peer.id)}
+                    onChange={() => setContactIds((current) => current.includes(peer.id) ? current.filter((id) => id !== peer.id) : [...current, peer.id])}
+                  />
+                  <span>{peer.name}</span>
+                  <span className="muted">{peer.roleName}</span>
+                </label>
+              ))}
+            </div>
+            {contactError && <div className="alert">{contactError}</div>}
+            <div className="row">
+              <button className="btn primary" disabled={saving}>保存</button>
+              <button className="btn" type="button" disabled={saving} onClick={() => setContactsOpen(false)}>取消</button>
+            </div>
+          </form>
+        </div>
+      )}
+      {removing && (
+        <div className="modal-backdrop" onClick={() => { if (!saving) setRemoving(false); }}>
+          <form className="card form modal" onClick={(event) => event.stopPropagation()} onSubmit={confirmRemove}>
+            <h2>移除 {member.name}</h2>
+            {ownedBranches.length > 0 && (
+              <label className="check-line">
+                <input type="checkbox" checked={deleteBranches} onChange={(event) => setDeleteBranches(event.target.checked)} />
+                <span>同时删除分支</span>
+                <span className="muted">{ownedBranches.map((workspace) => workspace.branch).join("、")}</span>
+              </label>
+            )}
+            {ownedBranches.length === 0 && <p className="muted">这个成员没有单独分支。</p>}
+            {removeError && <div className="alert">{removeError}</div>}
+            <div className="row">
+              <button className="btn danger" disabled={saving}>确认移除</button>
+              <button className="btn" type="button" disabled={saving} onClick={() => setRemoving(false)}>取消</button>
+            </div>
+          </form>
+        </div>
+      )}
+      {branchToDelete && (
+        <div className="modal-backdrop" onClick={() => { if (!saving) setBranchToDelete(""); }}>
+          <form className="card form modal" onClick={(event) => event.stopPropagation()} onSubmit={confirmDeleteBranch}>
+            <h2>删除分支</h2>
+            <p>删除远程分支 {member.agent?.workspaces.find((workspace) => workspace.id === branchToDelete)?.branch}。成员会改回使用工作区基线。</p>
+            <div className="row">
+              <button className="btn danger" disabled={saving}>删除分支</button>
+              <button className="btn" type="button" disabled={saving} onClick={() => setBranchToDelete("")}>取消</button>
+            </div>
+          </form>
+        </div>
+      )}
       {member.agent && (
         <form className="form" onSubmit={dispatch}>
           <label>派发任务<textarea value={prompt} onChange={(event) => setPrompt(event.target.value)} /></label>
@@ -372,12 +608,243 @@ function MemberCard({ member, teamId, versions, onChanged, onError }: {
         </form>
       )}
       {member.testedServiceVersionId && <div className="meta">被测版本 {versions.find((item) => item.id === member.testedServiceVersionId)?.version}</div>}
+      {reposOpen && (
+        <RepoEditor
+          teamId={teamId}
+          teamName={teamName}
+          member={member}
+          catalog={catalog}
+          onClose={() => { if (!saving) setReposOpen(false); }}
+          onSaved={async () => { setReposOpen(false); await onChanged(); }}
+        />
+      )}
     </article>
   );
 }
 
-function MemberForm({ teamId, roles, catalog, versions, onCreated }: {
+function RepoEditor({ teamId, teamName, member, catalog, onClose, onSaved }: {
   teamId: string;
+  teamName: string;
+  member: MemberItem;
+  catalog: TeamCatalog | null;
+  onClose: () => void;
+  onSaved: () => Promise<void>;
+}) {
+  const [serviceIds, setServiceIds] = useState<string[]>(member.serviceIds);
+  const [groupRepos, setGroupRepos] = useState<{ sourceId: string; repoUrl: string }[]>([]);
+  const [createBranch, setCreateBranch] = useState(member.memberType === "agent");
+  const [branchMode, setBranchMode] = useState<"default" | "custom" | "existing">("default");
+  const [branchLeaf, setBranchLeaf] = useState("");
+  const [existingBranches, setExistingBranches] = useState<Record<string, string>>({});
+  const [branchLists, setBranchLists] = useState<Record<string, string[]>>({});
+  const [confirmLines, setConfirmLines] = useState<RepoLine[] | null>(null);
+  const [confirmTitle, setConfirmTitle] = useState("");
+  const [error, setError] = useState("");
+  const [saving, setSaving] = useState(false);
+
+  function toggleService(serviceId: string) {
+    setServiceIds((current) => current.includes(serviceId) ? current.filter((item) => item !== serviceId) : [...current, serviceId]);
+  }
+  function toggleGroupRepo(sourceId: string, repo: CatalogRepo) {
+    if (repo.serviceId) {
+      toggleService(repo.serviceId);
+      return;
+    }
+    setGroupRepos((current) => {
+      const exists = current.some((item) => item.sourceId === sourceId && item.repoUrl === repo.repoUrl);
+      return exists
+        ? current.filter((item) => !(item.sourceId === sourceId && item.repoUrl === repo.repoUrl))
+        : [...current, { sourceId, repoUrl: repo.repoUrl }];
+    });
+  }
+  function groupChecked(sourceId: string, repo: CatalogRepo) {
+    if (repo.serviceId) return serviceIds.includes(repo.serviceId);
+    return groupRepos.some((item) => item.sourceId === sourceId && item.repoUrl === repo.repoUrl);
+  }
+  function selectedRepos() {
+    const picks: { key: string; name: string; serviceId?: string; repoUrl: string; baseline: string }[] = [];
+    for (const address of catalog?.addresses ?? []) {
+      if (!serviceIds.includes(address.serviceId)) continue;
+      picks.push({ key: address.serviceId, name: address.name, serviceId: address.serviceId, repoUrl: address.repoUrl, baseline: address.baselineRef });
+    }
+    for (const group of catalog?.groups ?? []) {
+      for (const repo of group.repos) {
+        if (!groupChecked(group.id, repo)) continue;
+        if (repo.serviceId && picks.some((item) => item.serviceId === repo.serviceId)) continue;
+        picks.push({ key: repo.serviceId || repo.repoUrl, name: repo.name, serviceId: repo.serviceId ?? undefined, repoUrl: repo.repoUrl, baseline: repo.defaultBranch });
+      }
+    }
+    return picks;
+  }
+  const repoKey = [...serviceIds, ...groupRepos.map((item) => item.repoUrl)].join("|");
+  useEffect(() => {
+    if (member.memberType !== "agent" || !createBranch || branchMode !== "existing") return;
+    const picks = selectedRepos().filter((pick) => !pick.serviceId || !member.serviceIds.includes(pick.serviceId));
+    let cancelled = false;
+    (async () => {
+      const next: Record<string, string[]> = {};
+      for (const pick of picks) {
+        const sourceId = catalog?.groups.find((group) => group.repos.some((repo) => repo.repoUrl === pick.repoUrl))?.id;
+        const query = pick.serviceId
+          ? `serviceId=${encodeURIComponent(pick.serviceId)}`
+          : `sourceId=${encodeURIComponent(sourceId ?? "")}&repoUrl=${encodeURIComponent(pick.repoUrl)}`;
+        try {
+          const result = await api<{ branches: string[] }>(`/api/teams/${teamId}/branches?${query}`);
+          next[pick.key] = result.branches;
+        } catch (reason) {
+          next[pick.key] = [];
+          if (!cancelled) setError(errorText(reason));
+        }
+      }
+      if (!cancelled) setBranchLists(next);
+    })().catch((reason) => { if (!cancelled) setError(errorText(reason)); });
+    return () => { cancelled = true; };
+  }, [createBranch, branchMode, repoKey, teamId, member.memberType]);
+
+  function branchFor(pick: { key: string; name: string; baseline: string }) {
+    if (member.memberType !== "agent" || !createBranch) return pick.baseline || "基线";
+    if (branchMode === "existing") return existingBranches[pick.key] || "";
+    return previewBranch(teamName, member.name, branchMode === "custom" ? branchLeaf : pick.name);
+  }
+
+  function askConfirm(event: FormEvent) {
+    event.preventDefault();
+    setError("");
+    const picks = selectedRepos();
+    if (picks.length === 0) {
+      setError("至少保留一个代码仓");
+      return;
+    }
+    const added = picks.filter((pick) => !pick.serviceId || !member.serviceIds.includes(pick.serviceId));
+    const removed = member.services.filter((service) => !serviceIds.includes(service.id));
+    if (added.length === 0 && removed.length === 0) {
+      setError("代码仓没有变化");
+      return;
+    }
+    if (member.memberType === "agent" && createBranch && branchMode === "custom" && !branchLeaf.trim()) {
+      setError("请填写分支名");
+      return;
+    }
+    if (member.memberType === "agent" && createBranch && branchMode === "existing" && added.some((pick) => !existingBranches[pick.key])) {
+      setError("请为新增仓库选择已有分支");
+      return;
+    }
+    const lines: RepoLine[] = [
+      ...removed.map((service) => {
+        const workspace = member.agent?.workspaces.find((item) => item.serviceId === service.id);
+        return {
+          action: workspace && separateBranch(workspace) ? "删除分支" : "移出代码仓",
+          name: service.name,
+          repoUrl: service.repoUrl,
+          branch: workspace?.branch ?? catalog?.addresses.find((address) => address.serviceId === service.id)?.baselineRef ?? "基线",
+        };
+      }),
+      ...added.map((pick) => ({
+        action: member.memberType === "agent" && createBranch ? (branchMode === "existing" ? "使用已有分支" : "创建分支") : "使用基线",
+        name: pick.name,
+        repoUrl: pick.repoUrl,
+        branch: branchFor(pick),
+      })),
+    ];
+    setConfirmTitle(removed.length ? "修改代码仓" : "增加代码仓");
+    setConfirmLines(lines);
+  }
+
+  async function apply() {
+    setSaving(true);
+    setError("");
+    try {
+      const branch = member.memberType === "agent"
+        ? (createBranch
+          ? { create: true, mode: branchMode, name: branchMode === "custom" ? branchLeaf.trim() : undefined, existing: branchMode === "existing" ? selectedRepos().filter((pick) => !pick.serviceId || !member.serviceIds.includes(pick.serviceId)).map((pick) => ({ serviceId: pick.serviceId, repoUrl: pick.repoUrl, branch: existingBranches[pick.key] })) : undefined }
+          : { create: false })
+        : { create: false };
+      await api(`/api/teams/${teamId}/members/${member.id}/repos`, {
+        method: "PUT",
+        body: JSON.stringify({ serviceIds, groupRepos, branch }),
+      });
+      await onSaved();
+    } catch (reason) {
+      setError(errorText(reason));
+      setConfirmLines(null);
+    } finally {
+      setSaving(false);
+    }
+  }
+
+  return (
+    <div className="modal-backdrop" onClick={() => { if (!saving) onClose(); }}>
+      <form className="card form modal" onClick={(event) => event.stopPropagation()} onSubmit={askConfirm}>
+        <h2>代码仓 · {member.name}</h2>
+        <div className="source-repos">
+          {(catalog?.addresses ?? []).map((address) => (
+            <label key={address.serviceId} className="check-line">
+              <input type="checkbox" checked={serviceIds.includes(address.serviceId)} onChange={() => toggleService(address.serviceId)} />
+              <span>{address.name}</span>
+              <span className="muted">{address.repoUrl}</span>
+            </label>
+          ))}
+        </div>
+        {catalog?.groups.map((group) => (
+          <div key={group.id}>
+            <strong>群组 {group.name}</strong>
+            {group.error && <div className="alert">{group.error}</div>}
+            <div className="source-repos">
+              {group.repos.map((repo) => (
+                <label key={repo.repoUrl} className="check-line">
+                  <input type="checkbox" checked={groupChecked(group.id, repo)} onChange={() => toggleGroupRepo(group.id, repo)} />
+                  <span>{repo.name}</span>
+                  <span className="muted">{repo.repoUrl}</span>
+                </label>
+              ))}
+            </div>
+          </div>
+        ))}
+        {(catalog?.addresses.length ?? 0) === 0 && (catalog?.groups.length ?? 0) === 0 && <p className="muted">请先在工作区配置群组或仓库地址。</p>}
+        {member.memberType === "agent" && (
+          <div className="stack">
+            <label className="check-line">
+              <input type="checkbox" checked={createBranch} onChange={(event) => setCreateBranch(event.target.checked)} />
+              <span>为新增仓库创建分支</span>
+              <span className="muted">关闭后使用工作区基线</span>
+            </label>
+            {createBranch && (
+              <>
+                <div className="row">
+                  <button type="button" className={branchMode === "default" ? "btn primary" : "btn"} onClick={() => setBranchMode("default")}>默认名称</button>
+                  <button type="button" className={branchMode === "custom" ? "btn primary" : "btn"} onClick={() => setBranchMode("custom")}>自定义</button>
+                  <button type="button" className={branchMode === "existing" ? "btn primary" : "btn"} onClick={() => setBranchMode("existing")}>已有分支</button>
+                </div>
+                {branchMode === "custom" && <label>名称<input value={branchLeaf} onChange={(event) => setBranchLeaf(event.target.value)} placeholder="feature" maxLength={80} /></label>}
+                {branchMode === "existing" && selectedRepos().filter((pick) => !pick.serviceId || !member.serviceIds.includes(pick.serviceId)).map((pick) => (
+                  <label key={pick.key}>{pick.name}
+                    <select value={existingBranches[pick.key] ?? ""} onChange={(event) => setExistingBranches({ ...existingBranches, [pick.key]: event.target.value })}>
+                      <option value="">选择分支</option>
+                      {(branchLists[pick.key] ?? []).map((branchName) => <option key={branchName} value={branchName}>{branchName}</option>)}
+                    </select>
+                  </label>
+                ))}
+              </>
+            )}
+          </div>
+        )}
+        {error && !confirmLines && <div className="alert">{error}</div>}
+        <div className="row">
+          <button className="btn primary" disabled={saving}>保存</button>
+          <button className="btn" type="button" disabled={saving} onClick={onClose}>取消</button>
+        </div>
+      </form>
+      {confirmLines && (
+        <RepoConfirmDialog title={confirmTitle} lines={confirmLines} saving={saving} error={error} onCancel={() => { if (!saving) setConfirmLines(null); }} onConfirm={() => { void apply(); }} />
+      )}
+    </div>
+  );
+}
+
+function MemberForm({ teamId, teamName, members, roles, catalog, versions, onCreated }: {
+  teamId: string;
+  teamName: string;
+  members: MemberItem[];
   roles: RoleItem[];
   catalog: TeamCatalog | null;
   versions: VersionItem[];
@@ -388,6 +855,7 @@ function MemberForm({ teamId, roles, catalog, versions, onCreated }: {
   const [name, setName] = useState("");
   const [roleId, setRoleId] = useState(roles[0]?.id ?? "");
   const [creatingRole, setCreatingRole] = useState(false);
+  const [pickingRole, setPickingRole] = useState(false);
   const [roleCode, setRoleCode] = useState("");
   const [roleName, setRoleName] = useState("");
   const [roleDuties, setRoleDuties] = useState("");
@@ -398,6 +866,13 @@ function MemberForm({ teamId, roles, catalog, versions, onCreated }: {
   const [groupRepos, setGroupRepos] = useState<{ sourceId: string; repoUrl: string }[]>([]);
   const [model, setModel] = useState("");
   const [testedServiceVersionId, setTested] = useState("");
+  const [createBranch, setCreateBranch] = useState(false);
+  const [branchMode, setBranchMode] = useState<"default" | "custom" | "existing">("default");
+  const [branchLeaf, setBranchLeaf] = useState("");
+  const [existingBranches, setExistingBranches] = useState<Record<string, string>>({});
+  const [branchLists, setBranchLists] = useState<Record<string, string[]>>({});
+  const [contactIds, setContactIds] = useState<string[]>([]);
+  const [repoConfirm, setRepoConfirm] = useState<RepoLine[] | null>(null);
   const [error, setError] = useState("");
   const role = roles.find((item) => item.id === roleId) ?? roles[0];
   const activeRoleId = role?.id ?? "";
@@ -426,9 +901,79 @@ function MemberForm({ teamId, roles, catalog, versions, onCreated }: {
     return groupRepos.some((item) => item.sourceId === sourceId && item.repoUrl === repo.repoUrl);
   }
 
+  function selectedRepos() {
+    const picks: { key: string; name: string; serviceId?: string; sourceId?: string; repoUrl: string; baseline: string }[] = [];
+    for (const address of catalog?.addresses ?? []) {
+      if (!serviceIds.includes(address.serviceId)) continue;
+      picks.push({ key: address.serviceId, name: address.name, serviceId: address.serviceId, repoUrl: address.repoUrl, baseline: address.baselineRef });
+    }
+    for (const group of catalog?.groups ?? []) {
+      for (const repo of group.repos) {
+        if (!groupChecked(group.id, repo)) continue;
+        if (repo.serviceId && picks.some((item) => item.serviceId === repo.serviceId)) continue;
+        picks.push({
+          key: repo.serviceId || repo.repoUrl,
+          name: repo.name,
+          serviceId: repo.serviceId ?? undefined,
+          sourceId: repo.serviceId ? undefined : group.id,
+          repoUrl: repo.repoUrl,
+          baseline: repo.defaultBranch,
+        });
+      }
+    }
+    return picks;
+  }
+
+  const repoKey = [...serviceIds, ...groupRepos.map((item) => item.repoUrl)].join("|");
+  useEffect(() => {
+    if (kind !== "agent" || !createBranch || branchMode !== "existing") return;
+    const picks = selectedRepos();
+    let cancelled = false;
+    (async () => {
+      const next: Record<string, string[]> = {};
+      for (const pick of picks) {
+        const query = pick.serviceId
+          ? `serviceId=${encodeURIComponent(pick.serviceId)}`
+          : `sourceId=${encodeURIComponent(pick.sourceId ?? "")}&repoUrl=${encodeURIComponent(pick.repoUrl)}`;
+        try {
+          const result = await api<{ branches: string[] }>(`/api/teams/${teamId}/branches?${query}`);
+          next[pick.key] = result.branches;
+        } catch (reason) {
+          next[pick.key] = [];
+          if (!cancelled) setError(errorText(reason));
+        }
+      }
+      if (!cancelled) setBranchLists(next);
+    })().catch((reason) => { if (!cancelled) setError(errorText(reason)); });
+    return () => { cancelled = true; };
+  }, [kind, createBranch, branchMode, repoKey, teamId]);
+
   async function submit(event: FormEvent) {
     event.preventDefault();
     setError("");
+    try {
+      const picks = scoped ? selectedRepos() : [];
+      if (scoped && picks.length === 0) throw new Error("至少选择一个代码仓");
+      if (kind === "agent" && scoped && createBranch && branchMode === "custom" && !branchLeaf.trim()) throw new Error("请填写分支名");
+      if (kind === "agent" && scoped && createBranch && branchMode === "existing" && picks.some((pick) => !existingBranches[pick.key])) {
+        throw new Error("请为每个仓库选择已有分支");
+      }
+      if (picks.length > 0) {
+        setRepoConfirm(picks.map((pick) => ({
+          action: kind === "agent" && createBranch ? (branchMode === "existing" ? "使用已有分支" : "创建分支") : "使用基线",
+          name: pick.name,
+          repoUrl: pick.repoUrl,
+          branch: kind === "agent" && createBranch
+            ? (branchMode === "existing" ? existingBranches[pick.key] : previewBranch(teamName, name, branchMode === "custom" ? branchLeaf : pick.name))
+            : (pick.baseline || "基线"),
+        })));
+        return;
+      }
+      await performCreate();
+    } catch (reason) { setError(errorText(reason)); }
+  }
+
+  async function performCreate() {
     let chosenRoleId = activeRoleId;
     try {
       if (kind === "agent" && creatingRole) {
@@ -444,24 +989,40 @@ function MemberForm({ teamId, roles, catalog, versions, onCreated }: {
         });
         chosenRoleId = created.id;
       }
+      const picks = scoped ? selectedRepos() : [];
+      let branch: { create: boolean; mode?: "default" | "custom" | "existing"; name?: string; existing?: { serviceId?: string; repoUrl: string; branch: string }[] } | undefined;
+      if (kind === "agent" && scoped) {
+        if (!createBranch) branch = { create: false };
+        else if (branchMode === "custom") {
+          if (!branchLeaf.trim()) throw new Error("请填写分支名");
+          branch = { create: true, mode: "custom", name: branchLeaf.trim() };
+        } else if (branchMode === "existing") {
+          const existing = picks.map((pick) => ({ serviceId: pick.serviceId, repoUrl: pick.repoUrl, branch: existingBranches[pick.key] ?? "" }));
+          if (existing.some((item) => !item.branch)) throw new Error("请为每个仓库选择已有分支");
+          branch = { create: true, mode: "existing", existing };
+        } else branch = { create: true, mode: "default" };
+      }
       const payload = {
         roleId: chosenRoleId,
         dutyOverride,
         serviceIds: scoped ? serviceIds : [],
         groupRepos: scoped ? groupRepos : [],
         testedServiceVersionId: testedServiceVersionId || undefined,
+        contactMemberIds: contactIds,
       };
       if (kind === "human") {
         await api(`/api/teams/${teamId}/members/humans`, { method: "POST", body: JSON.stringify({ ...payload, email }) });
       } else {
-        await api(`/api/teams/${teamId}/members/agents`, { method: "POST", body: JSON.stringify({ ...payload, name, model: model || undefined }) });
+        await api(`/api/teams/${teamId}/members/agents`, { method: "POST", body: JSON.stringify({ ...payload, name, model: model || undefined, branch }) });
       }
-      setEmail(""); setName(""); setDutyOverride(""); setServiceIds([]); setGroupRepos([]);
+      setEmail(""); setName(""); setDutyOverride(""); setServiceIds([]); setGroupRepos([]); setContactIds([]); setBranchLeaf("");
+      setRepoConfirm(null);
       await onCreated();
     } catch (reason) { setError(errorText(reason)); }
   }
 
   return (
+    <>
     <form className="card form" onSubmit={submit}>
       <h2>加入成员</h2>
       <div className="row">
@@ -475,8 +1036,32 @@ function MemberForm({ teamId, roles, catalog, versions, onCreated }: {
       )}
       {kind === "agent" && (
         <div className="row">
-          <button type="button" className={!creatingRole ? "btn primary" : "btn"} onClick={() => setCreatingRole(false)}>选择角色</button>
-          <button type="button" className={creatingRole ? "btn primary" : "btn"} onClick={() => setCreatingRole(true)}>新建角色</button>
+          <button type="button" className={!creatingRole ? "btn primary" : "btn"} onClick={() => { setCreatingRole(false); setPickingRole(true); }}>选择角色</button>
+          <button type="button" className={creatingRole ? "btn primary" : "btn"} onClick={() => { setCreatingRole(true); setPickingRole(false); }}>新建角色</button>
+        </div>
+      )}
+      {kind === "agent" && !creatingRole && <p className="meta">当前角色：{role ? `${role.name} · ${role.code}` : "未选择"}</p>}
+      {pickingRole && (
+        <div className="modal-backdrop" onClick={() => setPickingRole(false)}>
+          <div className="card stack modal" onClick={(event) => event.stopPropagation()}>
+            <h2>选择角色</h2>
+            {roles.length === 0 && <p className="muted">还没有可选角色。</p>}
+            <div className="list">
+              {roles.map((item) => (
+                <button
+                  key={item.id}
+                  type="button"
+                  className={item.id === activeRoleId ? "role-option active" : "role-option"}
+                  onClick={() => { setRoleId(item.id); setCreatingRole(false); setPickingRole(false); setServiceIds([]); setGroupRepos([]); }}
+                >
+                  <strong>{item.name}</strong>
+                  <span className="meta">{item.code}</span>
+                  {item.duties && <span className="muted">{item.duties}</span>}
+                </button>
+              ))}
+            </div>
+            <button className="btn" type="button" onClick={() => setPickingRole(false)}>取消</button>
+          </div>
         </div>
       )}
       {kind === "agent" && creatingRole ? (
@@ -534,6 +1119,54 @@ function MemberForm({ teamId, roles, catalog, versions, onCreated }: {
           )}
         </div>
       )}
+      {kind === "agent" && scoped && (
+        <div className="stack">
+          <label className="check-line">
+            <input type="checkbox" checked={createBranch} onChange={(event) => setCreateBranch(event.target.checked)} />
+            <span>创建分支</span>
+            <span className="muted">关闭后使用工作区基线</span>
+          </label>
+          {createBranch && (
+            <>
+              <div className="row">
+                <button type="button" className={branchMode === "default" ? "btn primary" : "btn"} onClick={() => setBranchMode("default")}>默认名称</button>
+                <button type="button" className={branchMode === "custom" ? "btn primary" : "btn"} onClick={() => setBranchMode("custom")}>自定义</button>
+                <button type="button" className={branchMode === "existing" ? "btn primary" : "btn"} onClick={() => setBranchMode("existing")}>已有分支</button>
+              </div>
+              <p className="muted">默认名称和自定义会新建远程分支。已有分支直接使用，不再新建。</p>
+              {branchMode === "custom" && (
+                <label>名称<input value={branchLeaf} onChange={(event) => setBranchLeaf(event.target.value)} placeholder="feature" maxLength={80} /></label>
+              )}
+              {branchMode !== "existing" && selectedRepos().map((pick) => (
+                <div key={pick.key} className="meta">{pick.name}：{previewBranch(teamName, name, branchMode === "custom" ? branchLeaf : pick.name)}</div>
+              ))}
+              {branchMode === "existing" && selectedRepos().map((pick) => (
+                <label key={pick.key}>{pick.name}
+                  <select value={existingBranches[pick.key] ?? ""} onChange={(event) => setExistingBranches({ ...existingBranches, [pick.key]: event.target.value })}>
+                    <option value="">选择分支</option>
+                    {(branchLists[pick.key] ?? []).map((branchName) => <option key={branchName} value={branchName}>{branchName}</option>)}
+                  </select>
+                </label>
+              ))}
+              {selectedRepos().length === 0 && <p className="muted">先勾选仓库，再确定分支。</p>}
+            </>
+          )}
+        </div>
+      )}
+      {members.length > 0 && (
+        <div className="stack">
+          <strong>可沟通成员</strong>
+          <div className="source-repos">
+            {members.map((peer) => (
+              <label key={peer.id} className="check-line">
+                <input type="checkbox" checked={contactIds.includes(peer.id)} onChange={() => setContactIds((current) => current.includes(peer.id) ? current.filter((id) => id !== peer.id) : [...current, peer.id])} />
+                <span>{peer.name}</span>
+                <span className="muted">{peer.roleName}</span>
+              </label>
+            ))}
+          </div>
+        </div>
+      )}
       {kind === "agent" && <label>模型<input value={model} onChange={(event) => setModel(event.target.value)} placeholder="默认使用项目模型" /></label>}
       {selectedPermissions.includes("service:test") && (
         <label>被测版本
@@ -545,9 +1178,20 @@ function MemberForm({ teamId, roles, catalog, versions, onCreated }: {
           </select>
         </label>
       )}
-      {error && <div className="alert">{error}</div>}
+      {error && !repoConfirm && <div className="alert">{error}</div>}
       <button className="btn primary">加入</button>
     </form>
+    {repoConfirm && (
+      <RepoConfirmDialog
+        title="增加代码仓"
+        lines={repoConfirm}
+        saving={false}
+        error={error}
+        onCancel={() => setRepoConfirm(null)}
+        onConfirm={() => { void performCreate(); }}
+      />
+    )}
+    </>
   );
 }
 

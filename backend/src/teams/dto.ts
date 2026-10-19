@@ -1,6 +1,7 @@
 import { Type } from "class-transformer";
 import {
   IsArray,
+  IsBoolean,
   IsEmail,
   IsIn,
   IsOptional,
@@ -86,6 +87,42 @@ export class CreateSourceDto {
   baselineRef?: string;
 }
 
+export class ExistingBranchDto {
+  @IsOptional()
+  @IsUUID()
+  serviceId?: string;
+
+  @IsOptional()
+  @IsString()
+  @MaxLength(2000)
+  repoUrl?: string;
+
+  @IsString()
+  @MinLength(1)
+  @MaxLength(200)
+  branch: string;
+}
+
+export class BranchPlanDto {
+  @IsBoolean()
+  create: boolean;
+
+  @IsOptional()
+  @IsIn(["default", "custom", "existing"])
+  mode?: "default" | "custom" | "existing";
+
+  @IsOptional()
+  @IsString()
+  @MaxLength(80)
+  name?: string;
+
+  @IsOptional()
+  @IsArray()
+  @ValidateNested({ each: true })
+  @Type(() => ExistingBranchDto)
+  existing?: ExistingBranchDto[];
+}
+
 export class HumanMemberDto {
   @IsEmail()
   email: string;
@@ -110,6 +147,11 @@ export class HumanMemberDto {
   @IsOptional()
   @IsUUID()
   testedServiceVersionId?: string;
+
+  @IsOptional()
+  @IsArray()
+  @IsUUID("4", { each: true })
+  contactMemberIds?: string[];
 }
 
 export class AgentMemberDto {
@@ -143,6 +185,39 @@ export class AgentMemberDto {
   @IsOptional()
   @IsUUID()
   testedServiceVersionId?: string;
+
+  @IsOptional()
+  @ValidateNested()
+  @Type(() => BranchPlanDto)
+  branch?: BranchPlanDto;
+
+  @IsOptional()
+  @IsArray()
+  @IsUUID("4", { each: true })
+  contactMemberIds?: string[];
+}
+
+export class ReplaceMemberReposDto {
+  @IsArray()
+  @IsUUID("4", { each: true })
+  serviceIds: string[];
+
+  @IsOptional()
+  @IsArray()
+  @ValidateNested({ each: true })
+  @Type(() => GroupRepoDto)
+  groupRepos?: GroupRepoDto[];
+
+  @IsOptional()
+  @ValidateNested()
+  @Type(() => BranchPlanDto)
+  branch?: BranchPlanDto;
+}
+
+export class UpdateContactsDto {
+  @IsArray()
+  @IsUUID("4", { each: true })
+  memberIds: string[];
 }
 
 export class UpdateMemberDto {

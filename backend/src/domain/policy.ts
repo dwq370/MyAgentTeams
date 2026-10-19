@@ -135,6 +135,33 @@ export function workspaceBranch(agentName: string, agentId: string, serviceName:
   return `agents/${agentSlug}/${serviceSlug}`;
 }
 
+export function branchSegment(raw: string): string {
+  const value = raw
+    .trim()
+    .replace(/[\s/]+/g, "-")
+    .replace(/-+/g, "-")
+    .replace(/^-+|-+$/g, "");
+  if (!value) throw new DomainError("分支名不能为空");
+  if (
+    value === "@" ||
+    value.includes("..") ||
+    value.includes("@{") ||
+    value.endsWith(".lock") ||
+    value.endsWith(".") ||
+    value.startsWith(".")
+  ) {
+    throw new DomainError("分支名包含不能使用的字符");
+  }
+  if (/[\u0000-\u001f\u007f~^:?*\[\\]/.test(value)) throw new DomainError("分支名包含不能使用的字符");
+  return value;
+}
+
+export function memberBranchName(teamName: string, memberName: string, leaf: string): string {
+  const name = `agentteams-${branchSegment(teamName)}/${branchSegment(memberName)}/${branchSegment(leaf)}`;
+  if (name.length > 200) throw new DomainError("分支名过长");
+  return name;
+}
+
 export function tagNameForVersion(version: string): string {
   return version.startsWith("v") ? version : `v${version}`;
 }

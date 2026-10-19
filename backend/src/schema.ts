@@ -142,7 +142,17 @@ export const SCHEMA_STATEMENTS = [
     baseline_ref varchar(200) NOT NULL,
     forked boolean NOT NULL,
     fork_status varchar(16) NOT NULL,
-    git_sha varchar(64)
+    git_sha varchar(64),
+    branch_origin varchar(16) NOT NULL DEFAULT 'baseline'
+  )`,
+  `ALTER TABLE agent_workspace ADD COLUMN IF NOT EXISTS branch_origin varchar(16) NOT NULL DEFAULT 'baseline'`,
+  `UPDATE agent_workspace SET branch_origin = 'created' WHERE forked = true AND branch_origin = 'baseline'`,
+  `CREATE TABLE IF NOT EXISTS member_contact (
+    id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+    member_id uuid NOT NULL REFERENCES team_member(id) ON DELETE CASCADE,
+    peer_member_id uuid NOT NULL REFERENCES team_member(id) ON DELETE CASCADE,
+    UNIQUE (member_id, peer_member_id),
+    CHECK (member_id <> peer_member_id)
   )`,
   `CREATE TABLE IF NOT EXISTS member_service (
     id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
@@ -177,6 +187,8 @@ export const SCHEMA_STATEMENTS = [
     created_at timestamptz NOT NULL DEFAULT now(),
     finished_at timestamptz
   )`,
+  `ALTER TABLE agent_run ADD COLUMN IF NOT EXISTS usage jsonb`,
+  `ALTER TABLE agent_run ADD COLUMN IF NOT EXISTS duration_ms integer`,
   `CREATE TABLE IF NOT EXISTS test_report (
     id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
     service_version_id uuid NOT NULL REFERENCES service_version(id) ON DELETE CASCADE,
@@ -298,6 +310,7 @@ export const SCHEMA_STATEMENTS = [
     "agent",
     "agent_workspace",
     "member_service",
+    "member_contact",
     "work_item",
     "agent_run",
     "test_report",

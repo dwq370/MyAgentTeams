@@ -2,11 +2,38 @@ import { Injectable } from "@nestjs/common";
 import { DomainError } from "../domain/errors";
 import { ListedModel, ModelSelection, modelChoices, selectModel } from "./model-selection";
 
+type TokenCounts = {
+  inputTokens?: number;
+  outputTokens?: number;
+  cacheReadTokens?: number;
+  cacheWriteTokens?: number;
+  totalTokens?: number;
+  reasoningTokens?: number;
+};
+
+type UsageCost = { rawCostCents?: number; chargedCents?: number };
+
+export interface CursorUsage {
+  inputTokens: number;
+  outputTokens: number;
+  cacheReadTokens: number;
+  cacheWriteTokens: number;
+  totalTokens: number;
+  reasoningTokens: number;
+  rawCostCents: number | null;
+  chargedCents: number | null;
+}
+
+export interface CursorAgentUsage {
+  usage: CursorUsage;
+  runs: { runId: string; usage: CursorUsage }[];
+}
+
 type SdkRun = {
   id: string;
   supports: (operation: string) => boolean;
   cancel: () => Promise<void>;
-  wait: () => Promise<{ status: string; result?: string; error?: { message?: string } }>;
+  wait: () => Promise<{ status: string; result?: string; error?: { message?: string }; durationMs?: number; usage?: TokenCounts }>;
 };
 
 type SdkAgent = {
@@ -20,6 +47,11 @@ type SdkModule = {
   Agent: {
     create: (options: unknown) => Promise<SdkAgent>;
     resume: (agentId: string, options: unknown) => Promise<SdkAgent>;
+    getUsage: (agentId: string, options?: { apiKey?: string }) => Promise<{
+      usage: TokenCounts;
+      cost?: UsageCost;
+      runs: { runId: string; usage: TokenCounts; cost?: UsageCost }[];
+    }>;
   };
   CursorAgentError: new (...args: never[]) => Error;
 };
@@ -36,6 +68,8 @@ export interface CursorRunOutcome {
   retryable?: boolean;
   helpUrl?: string;
   text?: string;
+  durationMs?: number;
+  usage?: CursorUsage;
 }
 
 @Injectable()
@@ -113,11 +147,12 @@ export class CursorPlatformAdapter {
       await input.onRunId(run.id);
       if ((await input.shouldCancel()) && run.supports("cancel")) await run.cancel();
       const result = await run.wait();
-      if (result.status === "cancelled") return { kind: "cancelled", runId: run.id };
+      const measured = { durationMs: result.durationMs, usage: this.usageFrom(result.usage) };
+      if (result.status === "cancelled") return { kind: "cancelled", runId: run.id, ...measured };
       if (result.status === "error") {
-        return { kind: "run_error", runId: run.id, message: result.error?.message || "运行失败" };
+        return { kind: "run_error", runId: run.id, message: result.error?.message || "运行失败", ...measured };
       }
-      return { kind: "finished", runId: run.id, text: result.result ?? "" };
+      return { kind: "finished", runId: run.id, text: result.result ?? "", ...measured };
     } catch (error) {
       const helpUrl = typeof error === "object" && error && "helpUrl" in error ? String((error as { helpUrl?: string }).helpUrl) : undefined;
       const retryable = typeof error === "object" && error && "isRetryable" in error ? Boolean((error as { isRetryable?: boolean }).isRetryable) : false;
@@ -129,6 +164,38 @@ export class CursorPlatformAdapter {
     } finally {
       await agent?.[Symbol.asyncDispose]().catch(() => undefined);
     }
+  }
+
+  async usage(apiKey: string, externalAgentId: string): Promise<CursorAgentUsage | null> {
+    const sdk = await this.load();
+    try {
+      const result = await sdk.Agent.getUsage(externalAgentId, { apiKey });
+      const usage = this.usageFrom(result.usage, result.cost);
+      if (!usage) return null;
+      return {
+        usage,
+        runs: result.runs.flatMap((run) => {
+          const mapped = this.usageFrom(run.usage, run.cost);
+          return mapped ? [{ runId: run.runId, usage: mapped }] : [];
+        }),
+      };
+    } catch {
+      return null;
+    }
+  }
+
+  private usageFrom(usage?: TokenCounts, cost?: UsageCost): CursorUsage | undefined {
+    if (!usage) return undefined;
+    return {
+      inputTokens: usage.inputTokens ?? 0,
+      outputTokens: usage.outputTokens ?? 0,
+      cacheReadTokens: usage.cacheReadTokens ?? 0,
+      cacheWriteTokens: usage.cacheWriteTokens ?? 0,
+      totalTokens: usage.totalTokens ?? 0,
+      reasoningTokens: usage.reasoningTokens ?? 0,
+      rawCostCents: cost?.rawCostCents ?? null,
+      chargedCents: cost?.chargedCents ?? null,
+    };
   }
 
   private async listModels(apiKey: string): Promise<ListedModel[]> {

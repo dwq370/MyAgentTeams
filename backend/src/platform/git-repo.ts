@@ -68,8 +68,21 @@ export class GitRepoClient {
     return this.gitlab.ensureBranch(repo, token, baseline, branch);
   }
 
-  async deleteBranch(serviceId: string, repoUrl: string, branch: string) {
-    const token = await this.tokenFor(serviceId);
+  async listBranches(serviceId: string, repoUrl: string) {
+    const token = await this.requireToken(serviceId, "未配置 Git 访问令牌，无法读取分支");
+    return this.listBranchesWithToken(repoUrl, token);
+  }
+
+  async listBranchesWithToken(repoUrl: string, token: string) {
+    const repo = this.parse(repoUrl);
+    if (repo.host === "github") return this.github.listBranches(token, repoUrl);
+    return this.gitlab.listBranches(repo, token);
+  }
+
+  async deleteBranch(serviceId: string, repoUrl: string, branch: string, options?: { required?: boolean }) {
+    const token = options?.required
+      ? await this.requireToken(serviceId, "未配置 Git 访问令牌，无法删除分支")
+      : await this.tokenFor(serviceId);
     if (!token) return;
     const repo = this.parse(repoUrl);
     if (repo.host === "github") await this.github.deleteBranch(token, repoUrl, branch);

@@ -13,17 +13,19 @@ import {
   forksWorkspace,
   invalidGroupMessage,
   invalidRepoMessage,
+  memberBranchName,
   parseGitGroup,
   parseGitRepo,
   RemoteRepo,
   repoIdentity,
-  workspaceBranch,
 } from "../domain/policy";
 import {
   AgentEntity,
   AgentWorkspaceEntity,
+  MemberContactEntity,
   MemberServiceEntity,
   ProjectRoleEntity,
+  RunUsageSnapshot,
   ServiceEntity,
   ServiceVersionEntity,
   TeamEntity,
@@ -34,6 +36,7 @@ import {
   UserEntity,
   WorkItemEntity,
 } from "../entities";
+import { CursorPlatformAdapter, CursorUsage } from "../platform/cursor.adapter";
 import { GitRepoClient } from "../platform/git-repo";
 import { QueueService } from "../platform/queue.service";
 
@@ -46,6 +49,7 @@ export class TeamsService {
     private readonly engines: AgentEnginesService,
     private readonly config: ConfigService,
     private readonly git: GitRepoClient,
+    private readonly cursor: CursorPlatformAdapter,
     @InjectRepository(TeamEntity) private readonly teams: Repository<TeamEntity>,
     @InjectRepository(TestEnvironmentEntity) private readonly environments: Repository<TestEnvironmentEntity>,
     @InjectRepository(TeamWorkspaceEntity) private readonly workspaces: Repository<TeamWorkspaceEntity>,
@@ -57,6 +61,7 @@ export class TeamsService {
     @InjectRepository(AgentEntity) private readonly agents: Repository<AgentEntity>,
     @InjectRepository(AgentWorkspaceEntity) private readonly agentWorkspaces: Repository<AgentWorkspaceEntity>,
     @InjectRepository(MemberServiceEntity) private readonly memberServices: Repository<MemberServiceEntity>,
+    @InjectRepository(MemberContactEntity) private readonly contacts: Repository<MemberContactEntity>,
     @InjectRepository(WorkItemEntity) private readonly workItems: Repository<WorkItemEntity>,
     @InjectRepository(ServiceVersionEntity) private readonly versions: Repository<ServiceVersionEntity>,
   ) {}
@@ -378,6 +383,86 @@ export class TeamsService {
     return { ok: true };
   }
 
+  async monitor(userId: string, teamId: string) {
+    const { team } = await this.access.requireTeam(userId, teamId, "member");
+    const members = await this.listMembers(userId, teamId);
+    const tasks = await this.workItems.find({ where: { teamId }, order: { updatedAt: "DESC" } });
+    const sessions = await this.dataSource.query(
+      `SELECT r.id, r.agent_id, r.work_item_id, r.prompt, r.status, r.error_message,
+              r.external_run_id, r.usage, r.duration_ms, r.created_at, r.finished_at,
+              LEFT(r.log, 240) AS log_preview, a.member_id
+       FROM agent_run r
+       JOIN agent a ON a.id = r.agent_id
+       JOIN team_member m ON m.id = a.member_id
+       WHERE m.team_id = $1
+       ORDER BY r.created_at DESC
+       LIMIT 200`,
+      [teamId],
+    );
+    const secrets = await this.engines.secretsForProject(team.projectId);
+    const live = new Map<string, { usage: CursorUsage; runs: { runId: string; usage: CursorUsage }[] } | null>();
+    if (secrets.apiKey) {
+      await Promise.all(
+        members
+          .filter((member) => member.agent?.externalAgentId)
+          .map(async (member) => {
+            const agent = member.agent;
+            if (!agent?.externalAgentId) return;
+            const usage = await this.cursorUsage(secrets.apiKey as string, agent.externalAgentId);
+            live.set(agent.id, usage);
+            if (!usage) return;
+            for (const run of usage.runs) {
+              await this.dataSource.query(
+                `UPDATE agent_run SET usage = $1::jsonb WHERE agent_id = $2 AND external_run_id = $3`,
+                [JSON.stringify(run.usage), agent.id, run.runId],
+              );
+            }
+          }),
+      );
+    }
+    const presented = members.map((member) => {
+      const memberTasks = tasks.filter((task) => task.assigneeMemberId === member.id);
+      const memberSessions = (sessions as MonitorSessionRow[])
+        .filter((session) => session.member_id === member.id)
+        .map((session) => this.presentSession(session, live.get(member.agent?.id ?? "")?.runs ?? []));
+      const currentTasks = memberTasks.filter((task) => task.status === "in_progress").map((task) => this.presentTask(task));
+      const currentSession = memberSessions.find((session) => session.status === "queued" || session.status === "running") ?? null;
+      const agentUsage = member.agent ? live.get(member.agent.id)?.usage ?? null : null;
+      const usage = agentUsage ?? sumUsage(memberSessions.map((session) => session.usage));
+      const hasUsage = member.memberType === "agent" && (agentUsage !== null || memberSessions.some((session) => session.usage));
+      return {
+        id: member.id,
+        name: member.name,
+        memberType: member.memberType,
+        roleName: member.roleName,
+        status: member.status,
+        failureReason: member.failureReason,
+        activity: this.activity(member.status, currentTasks.length > 0 || Boolean(currentSession)),
+        model: member.agent?.model ?? null,
+        currentTasks,
+        currentSession,
+        processedTasks: memberTasks.filter((task) => task.status === "done").map((task) => this.presentTask(task)),
+        sessions: memberSessions,
+        usage: member.memberType === "agent" ? usage : null,
+        usageNote: this.usageNote(member.memberType, member.agent?.externalAgentId ?? null, hasUsage, Boolean(secrets.apiKey)),
+      };
+    });
+    const teamUsage = sumUsage(presented.map((member) => member.usage));
+    return {
+      teamId: team.id,
+      teamName: team.name,
+      summary: {
+        members: presented.length,
+        working: presented.filter((member) => member.activity === "working").length,
+        doneTasks: tasks.filter((task) => task.status === "done").length,
+        sessions: sessions.length,
+        totalTokens: teamUsage?.totalTokens ?? 0,
+        chargedCents: teamUsage?.chargedCents ?? null,
+      },
+      members: presented,
+    };
+  }
+
   async listMembers(userId: string, teamId: string) {
     await this.access.requireTeam(userId, teamId, "member");
     const members = await this.members.find({ where: { teamId }, order: { createdAt: "ASC" } });
@@ -394,6 +479,7 @@ export class TeamsService {
       serviceIds: string[];
       groupRepos?: { sourceId: string; repoUrl: string }[];
       testedServiceVersionId?: string;
+      contactMemberIds?: string[];
     },
   ) {
     const { team } = await this.access.requireTeam(userId, teamId, "admin");
@@ -420,6 +506,7 @@ export class TeamsService {
         }),
       );
       await this.replaceServices(manager, created.id, serviceIds);
+      await this.replaceContacts(manager, created.id, teamId, input.contactMemberIds ?? []);
       return created;
     });
     return this.presentMember(member);
@@ -436,12 +523,18 @@ export class TeamsService {
       groupRepos?: { sourceId: string; repoUrl: string }[];
       model?: string;
       testedServiceVersionId?: string;
+      branch?: BranchPlan;
+      contactMemberIds?: string[];
     },
   ) {
     const { team } = await this.access.requireTeam(userId, teamId, "admin");
     const role = await this.requireOwnedRole(userId, input.roleId);
     const serviceIds = await this.assignedServiceIds(team, role.permissions, input.serviceIds, input.groupRepos);
     await this.assertAssignment(teamId, role.permissions, serviceIds, input.testedServiceVersionId);
+    const plan = input.branch ?? { create: false };
+    if (assignmentRequired(role.permissions) && plan.create) {
+      await this.prepareBranchPlan(team.name, input.name.trim(), serviceIds, plan);
+    }
     const model = input.model?.trim() || (await this.engines.defaultModelForProject(team.projectId));
     const created = await this.dataSource.transaction(async (manager) => {
       const member = await manager.save(
@@ -467,7 +560,16 @@ export class TeamsService {
         }),
       );
       await this.replaceServices(manager, member.id, serviceIds);
-      await this.writeWorkspaces(manager, agent.id, member.name, teamId, role.permissions, serviceIds);
+      await this.replaceContacts(manager, member.id, teamId, input.contactMemberIds ?? []);
+      await this.writeWorkspaces(manager, {
+        agentId: agent.id,
+        agentName: member.name,
+        teamId,
+        teamName: team.name,
+        permissions: role.permissions,
+        serviceIds,
+        plan,
+      });
       return agent;
     });
     await this.enqueueCreate(created.id);
@@ -513,7 +615,7 @@ export class TeamsService {
     }
     member.roleId = nextRole.id;
     if (input.dutyOverride !== undefined) member.dutyOverride = input.dutyOverride.trim();
-    if (input.name && member.memberType === "agent") member.name = input.name.trim();
+    if (input.name) member.name = input.name.trim();
     if (tested !== undefined) member.testedServiceVersionId = tested;
     await this.members.save(member);
     if (servicesTouched && !agent?.externalAgentId) {
@@ -521,7 +623,15 @@ export class TeamsService {
         await this.replaceServices(manager, member.id, serviceIds);
         if (agent) {
           await manager.delete(AgentWorkspaceEntity, { agentId: agent.id });
-          await this.writeWorkspaces(manager, agent.id, member.name, teamId, nextRole.permissions, serviceIds);
+          await this.writeWorkspaces(manager, {
+            agentId: agent.id,
+            agentName: member.name,
+            teamId,
+            teamName: team.name,
+            permissions: nextRole.permissions,
+            serviceIds,
+            plan: { create: false },
+          });
         }
       });
     } else if (servicesTouched) {
@@ -533,11 +643,167 @@ export class TeamsService {
     return this.presentMember(await this.requireMember(teamId, memberId));
   }
 
-  async removeMember(userId: string, teamId: string, memberId: string) {
+  async replaceMemberRepos(
+    userId: string,
+    teamId: string,
+    memberId: string,
+    input: {
+      serviceIds: string[];
+      groupRepos?: { sourceId: string; repoUrl: string }[];
+      branch?: BranchPlan;
+    },
+  ) {
+    await this.access.requireTeam(userId, teamId, "admin");
+    const member = await this.requireMember(teamId, memberId);
+    const team = await this.teams.findOneOrFail({ where: { id: teamId } });
+    const role = await this.requireRole(member.roleId);
+    if (!assignmentRequired(role.permissions)) throw new DomainError("该角色不按代码仓分配");
+    if (member.status === "pending") throw new DomainError("成员正在创建，完成后再修改代码仓");
+    const serviceIds = await this.assignedServiceIds(team, role.permissions, input.serviceIds, input.groupRepos);
+    await this.assertAssignment(teamId, role.permissions, serviceIds, member.testedServiceVersionId);
+    const currentIds = (await this.memberServices.find({ where: { memberId } })).map((link) => link.serviceId);
+    const same = serviceIds.length === currentIds.length && serviceIds.every((serviceId) => currentIds.includes(serviceId));
+    if (same) return this.presentMember(member);
+    const added = serviceIds.filter((serviceId) => !currentIds.includes(serviceId));
+    const removed = currentIds.filter((serviceId) => !serviceIds.includes(serviceId));
+    const agent = member.memberType === "agent" ? await this.agents.findOne({ where: { memberId } }) : null;
+    if (agent?.status === "pending") throw new DomainError("Agent 正在创建，完成后再修改代码仓");
+    const plan = input.branch ?? { create: member.memberType === "agent", mode: "default" as const };
+    const existingWorkspaces = agent ? await this.agentWorkspaces.find({ where: { agentId: agent.id } }) : [];
+    const teamWorkspaces = await this.workspaces.find({ where: { teamId } });
+    const serviceRows = [...new Set([...serviceIds, ...removed])].length
+      ? await this.services.find({ where: { id: In([...new Set([...serviceIds, ...removed])]) } })
+      : [];
+    const planned: PlannedRepoWorkspace[] = [];
+    if (agent && added.length && plan.create) await this.prepareBranchPlan(team.name, member.name, added, plan);
+    if (agent) {
+      for (const serviceId of added) {
+        const service = serviceRows.find((item) => item.id === serviceId);
+        const parent = teamWorkspaces.find((item) => item.serviceId === serviceId);
+        if (!service || !parent) throw new DomainError("服务不在 Team 工作区中");
+        const resolved = this.resolveBranch(team.name, member.name, service, parent.baselineRef, plan);
+        planned.push({
+          serviceId,
+          parentWorkspaceId: parent.id,
+          repoUrl: service.repoUrl,
+          baselineRef: parent.baselineRef,
+          branch: resolved.branch,
+          forked: resolved.forked,
+          branchOrigin: resolved.branchOrigin,
+          gitSha: null,
+        });
+      }
+    }
+    const made: PlannedRepoWorkspace[] = [];
+    try {
+      for (const row of planned) {
+        if (row.branchOrigin !== "created") continue;
+        const result = await this.git.ensureBranch(row.serviceId, row.repoUrl, row.baselineRef, row.branch);
+        row.gitSha = result.sha;
+        if (result.created) made.push(row);
+      }
+      await this.dataSource.transaction(async (manager) => {
+        await this.replaceServices(manager, member.id, serviceIds);
+        if (!agent) return;
+        if (removed.length) await manager.delete(AgentWorkspaceEntity, { agentId: agent.id, serviceId: In(removed) });
+        for (const row of planned) {
+          await manager.save(
+            manager.create(AgentWorkspaceEntity, {
+              agentId: agent.id,
+              parentWorkspaceId: row.parentWorkspaceId,
+              serviceId: row.serviceId,
+              repoUrl: row.repoUrl,
+              branch: row.branch,
+              baselineRef: row.baselineRef,
+              forked: row.forked,
+              forkStatus: "ready",
+              branchOrigin: row.branchOrigin,
+              gitSha: row.gitSha,
+            }),
+          );
+        }
+      });
+    } catch (error) {
+      for (const row of made) await this.git.deleteBranch(row.serviceId, row.repoUrl, row.branch).catch(() => undefined);
+      throw error;
+    }
+    for (const serviceId of removed) {
+      const workspace = existingWorkspaces.find((item) => item.serviceId === serviceId);
+      if (!workspace || workspace.branchOrigin === "baseline") continue;
+      await this.git.deleteBranch(workspace.serviceId, workspace.repoUrl, workspace.branch, { required: true });
+    }
+    if (agent?.externalAgentId) {
+      await this.agents.update(agent.id, { externalAgentId: null, status: "pending" });
+      await this.members.update(member.id, { status: "pending", failureReason: null });
+      await this.enqueueCreate(agent.id);
+    }
+    return this.presentMember(await this.requireMember(teamId, memberId));
+  }
+
+  async updateContacts(userId: string, teamId: string, memberId: string, peerIds: string[]) {
+    await this.access.requireTeam(userId, teamId, "admin");
+    await this.requireMember(teamId, memberId);
+    await this.dataSource.transaction(async (manager) => {
+      await this.replaceContacts(manager, memberId, teamId, peerIds);
+    });
+    return this.presentMember(await this.requireMember(teamId, memberId));
+  }
+
+  async listRepoBranches(
+    userId: string,
+    teamId: string,
+    query: { serviceId?: string; sourceId?: string; repoUrl?: string },
+  ) {
+    await this.access.requireTeam(userId, teamId, "member");
+    if (query.serviceId) {
+      const workspace = await this.workspaces.findOne({ where: { teamId, serviceId: query.serviceId } });
+      if (!workspace) throw new DomainError("服务不在 Team 工作区中");
+      const service = await this.services.findOne({ where: { id: query.serviceId } });
+      if (!service) throw new DomainError("服务不存在", 404);
+      return { branches: await this.git.listBranches(service.id, service.repoUrl) };
+    }
+    if (query.sourceId && query.repoUrl) {
+      const source = await this.sources
+        .createQueryBuilder("source")
+        .addSelect("source.gitTokenEncrypted")
+        .where("source.id = :id AND source.team_id = :teamId", { id: query.sourceId, teamId })
+        .getOne();
+      if (!source || source.kind !== "group") throw new DomainError("群组不在这个 Team 工作区中");
+      if (!source.gitTokenEncrypted) throw new DomainError("群组未配置 Git 访问令牌");
+      const token = decryptSecret(source.gitTokenEncrypted, this.encryptionKey());
+      const repos = (await this.git.listGroup(source.url, token)).repos;
+      const wanted = repoIdentity(query.repoUrl);
+      const repo = repos.find((item) => repoIdentity(item.repoUrl) === wanted);
+      if (!repo) throw new DomainError("所选仓库不在群组中");
+      return { branches: await this.git.listBranchesWithToken(repo.repoUrl, token) };
+    }
+    throw new DomainError("请指定仓库");
+  }
+
+  async deleteMemberBranch(userId: string, teamId: string, memberId: string, workspaceId: string) {
+    await this.access.requireTeam(userId, teamId, "admin");
+    const member = await this.requireMember(teamId, memberId);
+    const agent = await this.agents.findOne({ where: { memberId: member.id } });
+    if (!agent) throw new DomainError("这个成员没有分支", 404);
+    const workspace = await this.agentWorkspaces.findOne({ where: { id: workspaceId, agentId: agent.id } });
+    if (!workspace) throw new DomainError("分支不存在", 404);
+    if (workspace.branchOrigin === "baseline") throw new DomainError("这条使用工作区基线，没有单独分支");
+    await this.git.deleteBranch(workspace.serviceId, workspace.repoUrl, workspace.branch, { required: true });
+    workspace.branch = workspace.baselineRef;
+    workspace.forked = false;
+    workspace.forkStatus = "ready";
+    workspace.branchOrigin = "baseline";
+    workspace.gitSha = null;
+    await this.agentWorkspaces.save(workspace);
+    return this.presentMember(await this.requireMember(teamId, memberId));
+  }
+
+  async removeMember(userId: string, teamId: string, memberId: string, deleteBranches = false) {
     const { membership } = await this.access.requireTeam(userId, teamId, "member");
     const member = await this.requireMember(teamId, memberId);
     const isSelf = member.userId === userId;
     if (membership.projectRole === "member" && !isSelf) throw new DomainError("需要项目管理员权限", 403);
+    if (deleteBranches) await this.deleteOwnedBranches(memberId);
     await this.dataSource.transaction(async (manager) => {
       await manager.query(`UPDATE service_version SET created_by_member_id = NULL WHERE created_by_member_id = $1`, [memberId]);
       await manager.query(`UPDATE test_report SET author_member_id = NULL WHERE author_member_id = $1`, [memberId]);
@@ -566,9 +832,31 @@ export class TeamsService {
     }
     const role = await this.requireRole(member.roleId);
     const serviceIds = (await this.memberServices.find({ where: { memberId: member.id } })).map((link) => link.serviceId);
+    const team = await this.teams.findOneOrFail({ where: { id: member.teamId } });
+    const previous = await this.agentWorkspaces.find({ where: { agentId: agent.id } });
+    const preserved = new Map(
+      previous.map((row) => [
+        row.serviceId,
+        {
+          branch: row.branch,
+          forked: row.forked,
+          forkStatus: row.branchOrigin === "created" ? ("planned" as const) : row.forkStatus,
+          branchOrigin: row.branchOrigin,
+          gitSha: row.branchOrigin === "created" ? null : row.gitSha,
+        },
+      ]),
+    );
     await this.dataSource.transaction(async (manager) => {
       await manager.delete(AgentWorkspaceEntity, { agentId: agent.id });
-      await this.writeWorkspaces(manager, agent.id, member.name, member.teamId, role.permissions, serviceIds);
+      await this.writeWorkspaces(manager, {
+        agentId: agent.id,
+        agentName: member.name,
+        teamId: member.teamId,
+        teamName: team.name,
+        permissions: role.permissions,
+        serviceIds,
+        preserved,
+      });
       await manager.update(AgentEntity, agent.id, { status: "pending" });
       await manager.update(TeamMemberEntity, member.id, { status: "pending", failureReason: null });
     });
@@ -656,35 +944,114 @@ export class TeamsService {
 
   private async writeWorkspaces(
     manager: DataSource["manager"],
-    agentId: string,
-    agentName: string,
-    teamId: string,
-    permissions: string[],
-    serviceIds: string[],
+    input: {
+      agentId: string;
+      agentName: string;
+      teamId: string;
+      teamName: string;
+      permissions: string[];
+      serviceIds: string[];
+      plan?: BranchPlan | null;
+      preserved?: Map<string, PreservedWorkspace>;
+    },
   ) {
-    const teamWorkspaces = await manager.find(TeamWorkspaceEntity, { where: { teamId } });
-    const fork = forksWorkspace(permissions);
-    const selected = teamWorkspaces.filter((workspace) => (fork ? serviceIds.includes(workspace.serviceId) : true));
-    if (fork && selected.length === 0) throw new DomainError("没有可 fork 的服务工作区");
+    const teamWorkspaces = await manager.find(TeamWorkspaceEntity, { where: { teamId: input.teamId } });
+    const assign = assignmentRequired(input.permissions);
+    const selected = teamWorkspaces.filter((workspace) => (assign ? input.serviceIds.includes(workspace.serviceId) : true));
+    if (assign && selected.length === 0) throw new DomainError("没有可分配的服务工作区");
     const serviceRows = selected.length
       ? await manager.find(ServiceEntity, { where: { id: In(selected.map((workspace) => workspace.serviceId)) } })
       : [];
     for (const workspace of selected) {
       const service = serviceRows.find((item) => item.id === workspace.serviceId);
       if (!service) continue;
+      const kept = input.preserved?.get(service.id);
+      const resolved =
+        kept ??
+        (assign
+          ? this.resolveBranch(input.teamName, input.agentName, service, workspace.baselineRef, input.plan)
+          : baselineWorkspace(workspace.baselineRef));
       await manager.save(
         manager.create(AgentWorkspaceEntity, {
-          agentId,
+          agentId: input.agentId,
           parentWorkspaceId: workspace.id,
           serviceId: service.id,
           repoUrl: service.repoUrl,
-          branch: fork ? workspaceBranch(agentName, agentId, service.name) : workspace.baselineRef,
+          branch: resolved.branch,
           baselineRef: workspace.baselineRef,
-          forked: fork,
-          forkStatus: fork ? "planned" : "ready",
-          gitSha: null,
+          forked: resolved.forked,
+          forkStatus: resolved.forkStatus,
+          branchOrigin: resolved.branchOrigin,
+          gitSha: kept?.gitSha ?? null,
         }),
       );
+    }
+  }
+
+  private resolveBranch(
+    teamName: string,
+    memberName: string,
+    service: ServiceEntity,
+    baselineRef: string,
+    plan?: BranchPlan | null,
+  ): PreservedWorkspace {
+    if (!plan?.create) return baselineWorkspace(baselineRef);
+    const mode = plan.mode ?? "default";
+    if (mode === "existing") {
+      const chosen = this.matchExisting(service, plan.existing ?? []);
+      if (!chosen) throw new DomainError(`请为 ${service.name} 选择已有分支`);
+      const branch = chosen.branch.trim();
+      if (!branch || branch.length > 200 || branch.includes("..")) throw new DomainError("分支名无效");
+      return { branch, forked: true, forkStatus: "ready", branchOrigin: "selected", gitSha: null };
+    }
+    const leaf = mode === "custom" ? (plan.name ?? "") : service.name;
+    return {
+      branch: memberBranchName(teamName, memberName, leaf),
+      forked: true,
+      forkStatus: "planned",
+      branchOrigin: "created",
+      gitSha: null,
+    };
+  }
+
+  private async prepareBranchPlan(teamName: string, memberName: string, serviceIds: string[], plan: BranchPlan) {
+    const services = serviceIds.length ? await this.services.find({ where: { id: In(serviceIds) } }) : [];
+    for (const serviceId of serviceIds) {
+      const service = services.find((item) => item.id === serviceId);
+      if (!service) throw new DomainError("服务不存在", 404);
+      const resolved = this.resolveBranch(teamName, memberName, service, service.defaultBranch, plan);
+      if (resolved.branchOrigin !== "selected") continue;
+      const branches = await this.git.listBranches(service.id, service.repoUrl);
+      if (!branches.includes(resolved.branch)) throw new DomainError(`${service.name} 没有分支 ${resolved.branch}`);
+    }
+  }
+
+  private matchExisting(service: ServiceEntity, existing: NonNullable<BranchPlan["existing"]>) {
+    return (
+      existing.find((item) => item.serviceId === service.id) ??
+      existing.find((item) => item.repoUrl && repoIdentity(item.repoUrl) === repoIdentity(service.repoUrl))
+    );
+  }
+
+  private async deleteOwnedBranches(memberId: string) {
+    const agent = await this.agents.findOne({ where: { memberId } });
+    if (!agent) return;
+    const rows = await this.agentWorkspaces.find({ where: { agentId: agent.id } });
+    for (const row of rows) {
+      if (row.branchOrigin === "baseline") continue;
+      await this.git.deleteBranch(row.serviceId, row.repoUrl, row.branch, { required: true });
+    }
+  }
+
+  private async replaceContacts(manager: DataSource["manager"], memberId: string, teamId: string, peerIds: string[]) {
+    const unique = [...new Set(peerIds)].filter((id) => id !== memberId);
+    if (unique.length) {
+      const peers = await manager.find(TeamMemberEntity, { where: { teamId, id: In(unique) } });
+      if (peers.length !== unique.length) throw new DomainError("可沟通成员不在这个 Team 中");
+    }
+    await manager.delete(MemberContactEntity, { memberId });
+    for (const peerMemberId of unique) {
+      await manager.save(manager.create(MemberContactEntity, { memberId, peerMemberId }));
     }
   }
 
@@ -719,6 +1086,59 @@ export class TeamsService {
           : null,
       };
     });
+  }
+
+  private async cursorUsage(apiKey: string, externalAgentId: string) {
+    try {
+      return await Promise.race([
+        this.cursor.usage(apiKey, externalAgentId),
+        new Promise<null>((resolve) => setTimeout(() => resolve(null), 8000)),
+      ]);
+    } catch {
+      return null;
+    }
+  }
+
+  private activity(status: string, busy: boolean): "creating" | "failed" | "working" | "idle" {
+    if (status === "failed") return "failed";
+    if (status === "pending") return "creating";
+    return busy ? "working" : "idle";
+  }
+
+  private usageNote(memberType: string, externalAgentId: string | null, hasUsage: boolean, hasKey: boolean) {
+    if (memberType !== "agent") return "人类成员不产生 token 用量";
+    if (!externalAgentId) return "Agent 尚未创建，没有会话用量";
+    if (!hasKey && !hasUsage) return "项目未配置 Agent 引擎";
+    if (!hasUsage) return "Cursor 尚未返回 token 用量";
+    return null;
+  }
+
+  private presentTask(task: WorkItemEntity) {
+    return {
+      id: task.id,
+      title: task.title,
+      description: task.description,
+      status: task.status,
+      updatedAt: task.updatedAt,
+    };
+  }
+
+  private presentSession(row: MonitorSessionRow, liveRuns: { runId: string; usage: CursorUsage }[]) {
+    const stored = readUsage(row.usage);
+    const live = row.external_run_id ? liveRuns.find((run) => run.runId === row.external_run_id)?.usage ?? null : null;
+    return {
+      id: row.id,
+      workItemId: row.work_item_id,
+      prompt: row.prompt,
+      status: row.status,
+      errorMessage: row.error_message,
+      externalRunId: row.external_run_id,
+      createdAt: row.created_at,
+      finishedAt: row.finished_at,
+      durationMs: row.duration_ms,
+      logPreview: row.log_preview ?? "",
+      usage: live ?? stored,
+    };
   }
 
   private encryptionKey() {
@@ -875,6 +1295,13 @@ export class TeamsService {
     const agent = member.memberType === "agent" ? await this.agents.findOne({ where: { memberId: member.id } }) : null;
     const workspaces = agent ? await this.agentWorkspaces.find({ where: { agentId: agent.id } }) : [];
     const services = links.length ? await this.services.find({ where: { id: In(links.map((link) => link.serviceId)) } }) : [];
+    const contactRows = await this.contacts.find({ where: { memberId: member.id } });
+    const peers = contactRows.length
+      ? await this.members.find({ where: { id: In(contactRows.map((row) => row.peerMemberId)) } })
+      : [];
+    const peerRoles = peers.length
+      ? await this.roles.find({ where: { id: In([...new Set(peers.map((peer) => peer.roleId))]) } })
+      : [];
     return {
       id: member.id,
       teamId: member.teamId,
@@ -890,7 +1317,13 @@ export class TeamsService {
       failureReason: member.failureReason,
       testedServiceVersionId: member.testedServiceVersionId,
       serviceIds: links.map((link) => link.serviceId),
-      services: services.map((service) => ({ id: service.id, name: service.name })),
+      services: services.map((service) => ({ id: service.id, name: service.name, repoUrl: service.repoUrl })),
+      contacts: peers.map((peer) => ({
+        id: peer.id,
+        name: peer.name,
+        memberType: peer.memberType,
+        roleName: peerRoles.find((role) => role.id === peer.roleId)?.name ?? "",
+      })),
       agent: agent
         ? {
             id: agent.id,
@@ -904,4 +1337,97 @@ export class TeamsService {
         : null,
     };
   }
+}
+
+type MonitorSessionRow = {
+  id: string;
+  work_item_id: string | null;
+  prompt: string;
+  status: string;
+  error_message: string | null;
+  external_run_id: string | null;
+  usage: RunUsageSnapshot | string | null;
+  duration_ms: number | null;
+  created_at: Date | string;
+  finished_at: Date | string | null;
+  log_preview: string | null;
+  member_id: string;
+};
+
+function readUsage(value: RunUsageSnapshot | string | null): RunUsageSnapshot | null {
+  if (!value) return null;
+  const parsed = typeof value === "string" ? (JSON.parse(value) as RunUsageSnapshot) : value;
+  if (!parsed || typeof parsed.totalTokens !== "number") return null;
+  return {
+    inputTokens: parsed.inputTokens ?? 0,
+    outputTokens: parsed.outputTokens ?? 0,
+    cacheReadTokens: parsed.cacheReadTokens ?? 0,
+    cacheWriteTokens: parsed.cacheWriteTokens ?? 0,
+    totalTokens: parsed.totalTokens ?? 0,
+    reasoningTokens: parsed.reasoningTokens ?? 0,
+    rawCostCents: parsed.rawCostCents ?? null,
+    chargedCents: parsed.chargedCents ?? null,
+  };
+}
+
+function sumUsage(items: Array<RunUsageSnapshot | null>): RunUsageSnapshot | null {
+  const present = items.filter((item): item is RunUsageSnapshot => Boolean(item));
+  if (present.length === 0) return null;
+  return present.reduce(
+    (total, item) => ({
+      inputTokens: total.inputTokens + item.inputTokens,
+      outputTokens: total.outputTokens + item.outputTokens,
+      cacheReadTokens: total.cacheReadTokens + item.cacheReadTokens,
+      cacheWriteTokens: total.cacheWriteTokens + item.cacheWriteTokens,
+      totalTokens: total.totalTokens + item.totalTokens,
+      reasoningTokens: total.reasoningTokens + item.reasoningTokens,
+      rawCostCents: addCents(total.rawCostCents, item.rawCostCents),
+      chargedCents: addCents(total.chargedCents, item.chargedCents),
+    }),
+    {
+      inputTokens: 0,
+      outputTokens: 0,
+      cacheReadTokens: 0,
+      cacheWriteTokens: 0,
+      totalTokens: 0,
+      reasoningTokens: 0,
+      rawCostCents: null,
+      chargedCents: null,
+    } satisfies RunUsageSnapshot,
+  );
+}
+
+function addCents(left: number | null, right: number | null) {
+  if (left == null && right == null) return null;
+  return (left ?? 0) + (right ?? 0);
+}
+
+type PlannedRepoWorkspace = {
+  serviceId: string;
+  parentWorkspaceId: string;
+  repoUrl: string;
+  baselineRef: string;
+  branch: string;
+  forked: boolean;
+  branchOrigin: AgentWorkspaceEntity["branchOrigin"];
+  gitSha: string | null;
+};
+
+type BranchPlan = {
+  create: boolean;
+  mode?: "default" | "custom" | "existing";
+  name?: string;
+  existing?: { serviceId?: string; repoUrl?: string; branch: string }[];
+};
+
+type PreservedWorkspace = {
+  branch: string;
+  forked: boolean;
+  forkStatus: AgentWorkspaceEntity["forkStatus"];
+  branchOrigin: AgentWorkspaceEntity["branchOrigin"];
+  gitSha: string | null;
+};
+
+function baselineWorkspace(baselineRef: string): PreservedWorkspace {
+  return { branch: baselineRef, forked: false, forkStatus: "ready", branchOrigin: "baseline", gitSha: null };
 }
