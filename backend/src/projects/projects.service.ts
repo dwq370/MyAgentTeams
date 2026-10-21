@@ -1,13 +1,15 @@
 import { Injectable } from "@nestjs/common";
 import { ConfigService } from "@nestjs/config";
 import { InjectRepository } from "@nestjs/typeorm";
-import { DataSource, Repository } from "typeorm";
+import { DataSource, In, Repository } from "typeorm";
 import { AgentEnginesService } from "../agent-engines/agent-engines.service";
 import { AccessService } from "../common/access.service";
 import { decryptSecret, encryptSecret, secretHint } from "../common/crypto";
 import { DomainError } from "../domain/errors";
 import { assertKnownPermissions, parseGitRepo, PERMISSIONS } from "../domain/policy";
 import {
+  AgentEntity,
+  AgentRunEntity,
   ProjectEntity,
   ProjectMemberEntity,
   ProjectRoleEntity,
@@ -17,6 +19,8 @@ import {
   TestEnvironmentEntity,
   UserEntity,
 } from "../entities";
+import { writeArchitectureFile } from "../platform/architecture-file";
+import { QueueService } from "../platform/queue.service";
 import { KubectlProbe } from "../platform/kubectl";
 import { SshProbe } from "../platform/ssh-probe";
 
@@ -29,6 +33,7 @@ export class ProjectsService {
     private readonly config: ConfigService,
     private readonly kubectl: KubectlProbe,
     private readonly ssh: SshProbe,
+    private readonly queue: QueueService,
     @InjectRepository(ProjectEntity) private readonly projects: Repository<ProjectEntity>,
     @InjectRepository(ProjectMemberEntity) private readonly projectMembers: Repository<ProjectMemberEntity>,
     @InjectRepository(ProjectRoleEntity) private readonly roles: Repository<ProjectRoleEntity>,
@@ -37,6 +42,8 @@ export class ProjectsService {
     @InjectRepository(TeamEntity) private readonly teams: Repository<TeamEntity>,
     @InjectRepository(TeamMemberEntity) private readonly teamMembers: Repository<TeamMemberEntity>,
     @InjectRepository(UserEntity) private readonly users: Repository<UserEntity>,
+    @InjectRepository(AgentEntity) private readonly agents: Repository<AgentEntity>,
+    @InjectRepository(AgentRunEntity) private readonly runs: Repository<AgentRunEntity>,
   ) {}
 
   async create(userId: string, input: { name: string; description?: string }) {
@@ -45,6 +52,7 @@ export class ProjectsService {
         manager.create(ProjectEntity, {
           name: input.name.trim(),
           description: input.description?.trim() ?? "",
+          architectureDescription: "",
           ownerId: userId,
         }),
       );
@@ -91,15 +99,80 @@ export class ProjectsService {
     return this.get(userId, projectId);
   }
 
-  async update(userId: string, projectId: string, input: { name?: string; description?: string }) {
+  async update(userId: string, projectId: string, input: { name?: string; description?: string; architectureDescription?: string }) {
     await this.access.requireProject(userId, projectId, "admin");
     const project = await this.requireProject(projectId);
-    const patch: { name?: string; description?: string } = {};
+    const patch: { name?: string; description?: string; architectureDescription?: string } = {};
     if (input.name) patch.name = input.name.trim();
     if (input.description !== undefined) patch.description = input.description.trim();
+    if (input.architectureDescription !== undefined) {
+      const text = input.architectureDescription.trim();
+      await writeArchitectureFile(this.config.get<string>("REPO_ROOT") || "/var/agentteam/repos", projectId, text);
+      patch.architectureDescription = text;
+    }
     if (Object.keys(patch).length > 0) await this.projects.update(projectId, patch);
     const membership = await this.access.requireProject(userId, projectId, "member");
     return this.presentProject({ ...project, ...patch }, membership.projectRole);
+  }
+
+  async listArchitects(userId: string, projectId: string) {
+    await this.access.requireProject(userId, projectId, "member");
+    const teams = await this.teams.find({ where: { projectId } });
+    if (teams.length === 0) return [];
+    const members = await this.teamMembers.find({ where: { teamId: In(teams.map((team) => team.id)), memberType: "agent" } });
+    if (members.length === 0) return [];
+    const roles = await this.roles.find({ where: { id: In(members.map((member) => member.roleId)) } });
+    const agents = await this.agents.find({ where: { memberId: In(members.map((member) => member.id)) } });
+    return members.flatMap((member) => {
+      const role = roles.find((item) => item.id === member.roleId);
+      const agent = agents.find((item) => item.memberId === member.id);
+      if (!role?.permissions.includes("architecture:write") || !agent) return [];
+      return [{
+        agentId: agent.id,
+        name: member.name,
+        teamId: member.teamId,
+        teamName: teams.find((team) => team.id === member.teamId)?.name ?? "",
+        status: member.status,
+      }];
+    });
+  }
+
+  async generateArchitecture(
+    userId: string,
+    projectId: string,
+    input: { agentId: string; source: "document" | "code"; document?: string },
+  ) {
+    await this.access.requireProject(userId, projectId, "admin");
+    const agent = await this.agents.findOne({ where: { id: input.agentId } });
+    if (!agent) throw new DomainError("架构师不存在", 404);
+    const member = await this.teamMembers.findOne({ where: { id: agent.memberId } });
+    const team = member ? await this.teams.findOne({ where: { id: member.teamId } }) : null;
+    if (!member || !team || team.projectId !== projectId) throw new DomainError("架构师不在这个项目中", 404);
+    const role = await this.roles.findOne({ where: { id: member.roleId } });
+    if (!role?.permissions.includes("architecture:write")) throw new DomainError("请选择系统架构师");
+    if (member.status !== "active" || agent.status !== "active" || !agent.externalAgentId) {
+      throw new DomainError("架构师还不可用，请等待创建完成");
+    }
+    const active = await this.runs.find({ where: { agentId: agent.id, status: In(["queued", "running"]) } });
+    if (active.length > 0) throw new DomainError("架构师正在执行任务", 409);
+    const document = input.document?.trim() ?? "";
+    if (input.source === "document" && !document) throw new DomainError("请填写或上传要阅读的文档");
+    const prompt = input.source === "document"
+      ? `请阅读下面的文档，整理成项目架构描述。正文会保存为 architecture.md，并作为架构师之后评估需求和分解任务的依据。只输出架构文档正文，使用 Markdown。\n\n${document}`
+      : "请按 Team 工作区的基线检出只读代码并通读源码，整理成项目架构描述。正文会保存为 architecture.md，并作为架构师之后评估需求和分解任务的依据。不要创建远端分支。只输出架构文档正文，使用 Markdown。包含系统上下文、模块边界、主要接口、数据和处理流程。不确定的地方明确写成假设。";
+    const run = await this.runs.save(this.runs.create({
+      agentId: agent.id,
+      workItemId: null,
+      prompt,
+      composedPrompt: "",
+      roleSnapshot: { source: input.source },
+      status: "queued",
+      log: "",
+      purpose: "architecture",
+      targetProjectId: projectId,
+    }));
+    await this.queue.enqueue({ kind: "send-run", runId: run.id }, `run-${run.id}`);
+    return { id: run.id, agentId: agent.id };
   }
 
   async remove(userId: string, projectId: string) {
@@ -425,6 +498,7 @@ export class ProjectsService {
       id: project.id,
       name: project.name,
       description: project.description,
+      architectureDescription: project.architectureDescription ?? "",
       ownerId: project.ownerId,
       projectRole,
       createdAt: project.createdAt,

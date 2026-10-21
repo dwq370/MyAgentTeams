@@ -48,6 +48,24 @@ export class UpdateProjectDto {
   @IsString()
   @MaxLength(4000)
   description?: string;
+
+  @IsOptional()
+  @IsString()
+  @MaxLength(200000)
+  architectureDescription?: string;
+}
+
+export class GenerateArchitectureDto {
+  @IsUUID()
+  agentId: string;
+
+  @IsIn(["document", "code"])
+  source: "document" | "code";
+
+  @IsOptional()
+  @IsString()
+  @MaxLength(100000)
+  document?: string;
 }
 
 export class AddProjectMemberDto {

@@ -241,6 +241,57 @@ export class TeamsService {
     return this.listWorkspaces(userId, teamId);
   }
 
+  async removeWorkspace(userId: string, teamId: string, serviceId: string) {
+    const { team } = await this.access.requireTeam(userId, teamId, "admin");
+    const workspace = await this.workspaces.findOne({ where: { teamId, serviceId } });
+    if (!workspace) throw new DomainError("仓库不在工作区中", 404);
+    const service = await this.services.findOne({ where: { id: serviceId, projectId: team.projectId } });
+    if (!service) throw new DomainError("服务不存在", 404);
+    const members = await this.members.find({ where: { teamId } });
+    const agents = members.length
+      ? await this.agents.find({ where: { memberId: In(members.map((member) => member.id)) } })
+      : [];
+    const rows = agents.length
+      ? await this.agentWorkspaces.find({ where: { agentId: In(agents.map((agent) => agent.id)), serviceId } })
+      : [];
+    const affectedIds = new Set(rows.map((row) => row.agentId));
+    const affectedAgents = agents.filter((agent) => affectedIds.has(agent.id));
+    const pending = affectedAgents.some((agent) => agent.status === "pending")
+      || members.some((member) => member.status === "pending" && affectedAgents.some((agent) => agent.memberId === member.id));
+    if (pending) throw new DomainError("有成员正在创建，完成后再删除仓库");
+    const remoteBranchesKept = rows
+      .filter((row) => row.branchOrigin !== "baseline")
+      .map((row) => {
+        const agent = agents.find((item) => item.id === row.agentId);
+        const member = members.find((item) => item.id === agent?.memberId);
+        return { memberName: member?.name ?? "", name: service.name, repoUrl: service.repoUrl, branch: row.branch };
+      });
+    const identity = repoIdentity(service.repoUrl);
+    await this.dataSource.transaction(async (manager) => {
+      if (rows.length) await manager.delete(AgentWorkspaceEntity, { id: In(rows.map((row) => row.id)) });
+      if (members.length) {
+        await manager
+          .createQueryBuilder()
+          .delete()
+          .from(MemberServiceEntity)
+          .where("service_id = :serviceId", { serviceId })
+          .andWhere("member_id IN (:...memberIds)", { memberIds: members.map((member) => member.id) })
+          .execute();
+      }
+      await manager.delete(TeamWorkspaceEntity, { id: workspace.id });
+      const sources = await manager.find(TeamSourceEntity, { where: { teamId, kind: "repo" } });
+      const matched = identity ? sources.filter((source) => repoIdentity(source.url) === identity) : [];
+      if (matched.length) await manager.delete(TeamSourceEntity, { id: In(matched.map((source) => source.id)) });
+    });
+    for (const row of rows) await this.git.removeLocal(row.localPath).catch(() => undefined);
+    for (const agent of affectedAgents) {
+      await this.agents.update(agent.id, { externalAgentId: null, status: "pending" });
+      await this.members.update(agent.memberId, { status: "pending", failureReason: null });
+      await this.enqueueCreate(agent.id);
+    }
+    return { ok: true, remoteBranchesKept };
+  }
+
   async catalog(userId: string, teamId: string) {
     const { team } = await this.access.requireTeam(userId, teamId, "member");
     const sources = await this.sources
@@ -368,19 +419,11 @@ export class TeamsService {
     if (!source) throw new DomainError("代码来源不存在", 404);
     if (source.kind === "repo") {
       const service = await this.findProjectService(team.projectId, source.url);
-      if (service) {
-        const occupied = await this.dataSource.query(
-          `SELECT count(*)::int AS count FROM member_service ms
-           JOIN team_member tm ON tm.id = ms.member_id
-           WHERE tm.team_id = $1 AND ms.service_id = $2`,
-          [teamId, service.id],
-        );
-        if (Number(occupied[0]?.count) > 0) throw new DomainError("该仓库已分配给成员，不能移除", 409);
-        await this.workspaces.delete({ teamId, serviceId: service.id });
-      }
+      const linked = service ? await this.workspaces.findOne({ where: { teamId, serviceId: service.id } }) : null;
+      if (service && linked) return this.removeWorkspace(userId, teamId, service.id);
     }
     await this.sources.delete(source.id);
-    return { ok: true };
+    return { ok: true, remoteBranchesKept: [] };
   }
 
   async monitor(userId: string, teamId: string) {
@@ -724,20 +767,31 @@ export class TeamsService {
         }
       });
     } catch (error) {
-      for (const row of made) await this.git.deleteBranch(row.serviceId, row.repoUrl, row.branch).catch(() => undefined);
+      const kept = made.map((row) => row.branch);
+      const message = error instanceof DomainError ? error.message : error instanceof Error ? error.message : "修改代码仓失败";
+      if (kept.length) throw new DomainError(`${message}。远端分支未删除，请到 Git 上手动删除：${kept.join("、")}`);
       throw error;
     }
-    for (const serviceId of removed) {
-      const workspace = existingWorkspaces.find((item) => item.serviceId === serviceId);
-      if (!workspace || workspace.branchOrigin === "baseline") continue;
-      await this.git.deleteBranch(workspace.serviceId, workspace.repoUrl, workspace.branch, { required: true });
+    if (agent) {
+      const removedRows = existingWorkspaces.filter((workspace) => removed.includes(workspace.serviceId));
+      for (const row of removedRows) await this.git.removeLocal(row.localPath).catch(() => undefined);
     }
-    if (agent?.externalAgentId) {
+    if (agent) {
       await this.agents.update(agent.id, { externalAgentId: null, status: "pending" });
       await this.members.update(member.id, { status: "pending", failureReason: null });
       await this.enqueueCreate(agent.id);
     }
-    return this.presentMember(await this.requireMember(teamId, memberId));
+    const remoteBranchesKept = existingWorkspaces
+      .filter((workspace) => removed.includes(workspace.serviceId) && workspace.branchOrigin !== "baseline")
+      .map((workspace) => ({
+        name: serviceRows.find((service) => service.id === workspace.serviceId)?.name ?? workspace.repoUrl,
+        repoUrl: workspace.repoUrl,
+        branch: workspace.branch,
+      }));
+    return {
+      ...(await this.presentMember(await this.requireMember(teamId, memberId))),
+      remoteBranchesKept,
+    };
   }
 
   async updateContacts(userId: string, teamId: string, memberId: string, peerIds: string[]) {
@@ -780,30 +834,16 @@ export class TeamsService {
     throw new DomainError("请指定仓库");
   }
 
-  async deleteMemberBranch(userId: string, teamId: string, memberId: string, workspaceId: string) {
-    await this.access.requireTeam(userId, teamId, "admin");
-    const member = await this.requireMember(teamId, memberId);
-    const agent = await this.agents.findOne({ where: { memberId: member.id } });
-    if (!agent) throw new DomainError("这个成员没有分支", 404);
-    const workspace = await this.agentWorkspaces.findOne({ where: { id: workspaceId, agentId: agent.id } });
-    if (!workspace) throw new DomainError("分支不存在", 404);
-    if (workspace.branchOrigin === "baseline") throw new DomainError("这条使用工作区基线，没有单独分支");
-    await this.git.deleteBranch(workspace.serviceId, workspace.repoUrl, workspace.branch, { required: true });
-    workspace.branch = workspace.baselineRef;
-    workspace.forked = false;
-    workspace.forkStatus = "ready";
-    workspace.branchOrigin = "baseline";
-    workspace.gitSha = null;
-    await this.agentWorkspaces.save(workspace);
-    return this.presentMember(await this.requireMember(teamId, memberId));
-  }
-
-  async removeMember(userId: string, teamId: string, memberId: string, deleteBranches = false) {
+  async removeMember(userId: string, teamId: string, memberId: string) {
     const { membership } = await this.access.requireTeam(userId, teamId, "member");
     const member = await this.requireMember(teamId, memberId);
     const isSelf = member.userId === userId;
     if (membership.projectRole === "member" && !isSelf) throw new DomainError("需要项目管理员权限", 403);
-    if (deleteBranches) await this.deleteOwnedBranches(memberId);
+    const agent = await this.agents.findOne({ where: { memberId } });
+    if (agent) {
+      const rows = await this.agentWorkspaces.find({ where: { agentId: agent.id } });
+      for (const row of rows) await this.git.removeLocal(row.localPath).catch(() => undefined);
+    }
     await this.dataSource.transaction(async (manager) => {
       await manager.query(`UPDATE service_version SET created_by_member_id = NULL WHERE created_by_member_id = $1`, [memberId]);
       await manager.query(`UPDATE test_report SET author_member_id = NULL WHERE author_member_id = $1`, [memberId]);
@@ -834,6 +874,7 @@ export class TeamsService {
     const serviceIds = (await this.memberServices.find({ where: { memberId: member.id } })).map((link) => link.serviceId);
     const team = await this.teams.findOneOrFail({ where: { id: member.teamId } });
     const previous = await this.agentWorkspaces.find({ where: { agentId: agent.id } });
+    for (const row of previous) await this.git.removeLocal(row.localPath).catch(() => undefined);
     const preserved = new Map(
       previous.map((row) => [
         row.serviceId,
@@ -1031,16 +1072,6 @@ export class TeamsService {
       existing.find((item) => item.serviceId === service.id) ??
       existing.find((item) => item.repoUrl && repoIdentity(item.repoUrl) === repoIdentity(service.repoUrl))
     );
-  }
-
-  private async deleteOwnedBranches(memberId: string) {
-    const agent = await this.agents.findOne({ where: { memberId } });
-    if (!agent) return;
-    const rows = await this.agentWorkspaces.find({ where: { agentId: agent.id } });
-    for (const row of rows) {
-      if (row.branchOrigin === "baseline") continue;
-      await this.git.deleteBranch(row.serviceId, row.repoUrl, row.branch, { required: true });
-    }
   }
 
   private async replaceContacts(manager: DataSource["manager"], memberId: string, teamId: string, peerIds: string[]) {

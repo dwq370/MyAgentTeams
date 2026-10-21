@@ -7,6 +7,7 @@ import {
   CreateRoleDto,
   CreateTestEnvironmentDto,
   ProbeTestEnvironmentDto,
+  GenerateArchitectureDto,
   UpdateProjectDto,
   UpdateProjectMemberDto,
   UpdateRoleDto,
@@ -42,6 +43,20 @@ export class ProjectsController {
   @Patch("projects/:projectId")
   update(@CurrentUser() user: AuthUser, @Param("projectId") projectId: string, @Body() body: UpdateProjectDto) {
     return this.projects.update(user.id, projectId, body);
+  }
+
+  @Get("projects/:projectId/architects")
+  architects(@CurrentUser() user: AuthUser, @Param("projectId") projectId: string) {
+    return this.projects.listArchitects(user.id, projectId);
+  }
+
+  @Post("projects/:projectId/architecture")
+  generateArchitecture(
+    @CurrentUser() user: AuthUser,
+    @Param("projectId") projectId: string,
+    @Body() body: GenerateArchitectureDto,
+  ) {
+    return this.projects.generateArchitecture(user.id, projectId, body);
   }
 
   @Delete("projects/:projectId")

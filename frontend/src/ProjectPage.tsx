@@ -1,4 +1,4 @@
-import { FormEvent, useEffect, useState } from "react";
+import { FormEvent, useEffect, useRef, useState } from "react";
 import { Link, useParams, useSearchParams } from "react-router-dom";
 import {
   AgentEngineItem,
@@ -9,6 +9,7 @@ import {
   KubernetesProbe,
   SshProbeResult,
   TestEnvironment,
+  token,
 } from "./api";
 import { roleLabel } from "./ProjectsPage";
 import { TeamMonitorView } from "./TeamMonitorPage";
@@ -91,10 +92,233 @@ function Overview({ project, projectId, manager, owner, onSaved }: { project: Pr
   } else if (complete && !finished) {
     setFinished(true);
   }
-  if (switching ? complete : finished || complete) {
-    return <ProjectHome project={project} projectId={projectId} manager={manager} owner={owner} onSaved={onSaved} />;
+  const ready = switching ? complete : finished || complete;
+  return (
+    <div className="stack">
+      <ArchitecturePanel project={project} projectId={projectId} manager={manager} onSaved={onSaved} />
+      {ready
+        ? <ProjectHome project={project} projectId={projectId} manager={manager} owner={owner} onSaved={onSaved} />
+        : <SetupWizard project={project} projectId={projectId} manager={manager} owner={owner} step={step} onStep={setStep} onSaved={onSaved} />}
+    </div>
+  );
+}
+
+function ArchitecturePanel({ project, projectId, manager, onSaved }: { project: Project; projectId: string; manager: boolean; onSaved: () => Promise<void> }) {
+  const [draft, setDraft] = useState(project.architectureDescription ?? "");
+  const [editing, setEditing] = useState(false);
+  const [architects, setArchitects] = useState<{ agentId: string; name: string; teamName: string; status: string }[]>([]);
+  const [agentId, setAgentId] = useState("");
+  const [source, setSource] = useState<"document" | "code">("code");
+  const [documentText, setDocumentText] = useState("");
+  const [run, setRun] = useState<{ agentId: string; id: string } | null>(null);
+  const [live, setLive] = useState(false);
+  const [error, setError] = useState("");
+  const [saving, setSaving] = useState(false);
+
+  useEffect(() => { setDraft(project.architectureDescription ?? ""); }, [project.architectureDescription]);
+  useEffect(() => {
+    api<{ agentId: string; name: string; teamName: string; status: string }[]>(`/api/projects/${projectId}/architects`)
+      .then((items) => {
+        setArchitects(items);
+        setAgentId((current) => current || items.find((item) => item.status === "active")?.agentId || "");
+      })
+      .catch((reason) => setError(errorText(reason)));
+  }, [projectId]);
+
+  async function save(event: FormEvent) {
+    event.preventDefault();
+    setSaving(true);
+    setError("");
+    try {
+      await api(`/api/projects/${projectId}`, { method: "PATCH", body: JSON.stringify({ architectureDescription: draft }) });
+      setEditing(false);
+      await onSaved();
+    } catch (reason) {
+      setError(errorText(reason));
+    } finally {
+      setSaving(false);
+    }
   }
-  return <SetupWizard project={project} projectId={projectId} manager={manager} owner={owner} step={step} onStep={setStep} onSaved={onSaved} />;
+
+  async function generate(event: FormEvent) {
+    event.preventDefault();
+    if (!agentId) {
+      setError("请选择系统架构师");
+      return;
+    }
+    setSaving(true);
+    setError("");
+    try {
+      const created = await api<{ id: string; agentId: string }>(`/api/projects/${projectId}/architecture`, {
+        method: "POST",
+        body: JSON.stringify({ agentId, source, document: source === "document" ? documentText : undefined }),
+      });
+      setRun(created);
+      setLive(true);
+    } catch (reason) {
+      setError(errorText(reason));
+    } finally {
+      setSaving(false);
+    }
+  }
+
+  return (
+    <section className="card stack">
+      <div className="split">
+        <h2>项目架构描述</h2>
+        {manager && !editing && <button className="btn" type="button" onClick={() => { setDraft(project.architectureDescription ?? ""); setEditing(true); }}>修改</button>}
+      </div>
+      {editing ? (
+        <form className="form" onSubmit={save}>
+          <textarea value={draft} onChange={(event) => setDraft(event.target.value)} rows={12} />
+          {error && <div className="alert">{error}</div>}
+          <div className="row">
+            <button className="btn primary" disabled={saving}>保存</button>
+            <button className="btn" type="button" disabled={saving} onClick={() => setEditing(false)}>取消</button>
+          </div>
+        </form>
+      ) : (
+        <div className="doc">{project.architectureDescription || "还没有架构描述。"}</div>
+      )}
+      {manager && (
+        <form className="form" onSubmit={generate}>
+          <p className="muted">选择系统架构师，让它阅读文档，或通读已检出的基线代码并生成架构描述。生成时显示 Agent 轨迹，可以停止。结果保存为 architecture.md，并作为架构师的系统提示词，用来评估需求和分解任务。生成结果可以再修改。</p>
+          {architects.length === 0 && <p className="muted">还没有系统架构师。请先在 Team 中加入架构师 Agent。</p>}
+          {architects.length > 0 && (
+            <label>架构师
+              <select value={agentId} onChange={(event) => setAgentId(event.target.value)}>
+                <option value="">选择架构师</option>
+                {architects.map((item) => (
+                  <option key={item.agentId} value={item.agentId} disabled={item.status !== "active"}>
+                    {item.name} · {item.teamName}{item.status === "active" ? "" : ` · ${item.status}`}
+                  </option>
+                ))}
+              </select>
+            </label>
+          )}
+          <div className="row">
+            <button type="button" className={source === "code" ? "btn primary" : "btn"} onClick={() => setSource("code")}>通读代码</button>
+            <button type="button" className={source === "document" ? "btn primary" : "btn"} onClick={() => setSource("document")}>阅读文档</button>
+          </div>
+          {source === "document" && (
+            <>
+              <label>文档<textarea value={documentText} onChange={(event) => setDocumentText(event.target.value)} rows={8} placeholder="粘贴架构材料、接口说明或设计笔记" /></label>
+              <label>上传文本
+                <input type="file" accept=".md,.txt,.markdown,text/plain" onChange={(event) => {
+                  const file = event.target.files?.[0];
+                  if (!file) return;
+                  file.text().then(setDocumentText).catch(() => setError("无法读取文档"));
+                }} />
+              </label>
+            </>
+          )}
+          {source === "code" && <p className="muted">会按 Team 工作区的基线检出只读代码并通读源码。架构师不创建远端分支。</p>}
+          {!editing && error && <div className="alert">{error}</div>}
+          <button className="btn primary" disabled={saving || !agentId || live}>生成架构文档</button>
+        </form>
+      )}
+      {run && <ArchitectureStream key={run.id} agentId={run.agentId} runId={run.id} onLive={setLive} onFinished={() => { onSaved().catch(() => undefined); }} />}
+    </section>
+  );
+}
+
+const RUN_LABEL: Record<string, string> = {
+  queued: "排队",
+  running: "进行中",
+  finished: "已完成",
+  cancelled: "已停止",
+  error: "运行失败",
+  startup_error: "启动失败",
+};
+
+function ArchitectureStream({ agentId, runId, onLive, onFinished }: { agentId: string; runId: string; onLive: (live: boolean) => void; onFinished: () => void }) {
+  const [log, setLog] = useState("");
+  const [status, setStatus] = useState("queued");
+  const [failure, setFailure] = useState("");
+  const [stopping, setStopping] = useState(false);
+  const [actionError, setActionError] = useState("");
+  const box = useRef<HTMLPreElement>(null);
+  const finished = useRef(false);
+  const live = status === "queued" || status === "running";
+  useEffect(() => { onLive(live); }, [live, onLive]);
+  useEffect(() => {
+    const node = box.current;
+    if (node) node.scrollTop = node.scrollHeight;
+  }, [log]);
+  useEffect(() => {
+    const controller = new AbortController();
+    let stopped = false;
+    (async () => {
+      const response = await fetch(`/api/agents/${agentId}/runs/${runId}/events`, {
+        headers: { Authorization: `Bearer ${token() ?? ""}` },
+        signal: controller.signal,
+      });
+      if (!response.ok || !response.body) {
+        setStatus("error");
+        setFailure("无法连接轨迹");
+        return;
+      }
+      const reader = response.body.getReader();
+      const decoder = new TextDecoder();
+      let buffer = "";
+      while (!stopped) {
+        const { value, done } = await reader.read();
+        if (done) break;
+        buffer += decoder.decode(value, { stream: true });
+        const parts = buffer.split("\n\n");
+        buffer = parts.pop() ?? "";
+        for (const part of parts) {
+          const line = part.split("\n").find((item) => item.startsWith("data:"));
+          if (!line) continue;
+          const payload = JSON.parse(line.slice(5).trim()) as { type?: string; log?: string; text?: string; status?: string; errorMessage?: string | null };
+          if (payload.type === "snapshot") {
+            setLog(payload.log ?? "");
+            if (payload.status) setStatus(payload.status);
+            setFailure(payload.errorMessage ?? "");
+            if (payload.status === "finished" && !finished.current) {
+              finished.current = true;
+              onFinished();
+            }
+          }
+          if (payload.type === "append" && payload.text) setLog((current) => current + payload.text);
+          if (payload.type === "status" && payload.status) {
+            setStatus(payload.status);
+            if (payload.errorMessage) setFailure(payload.errorMessage);
+            if (payload.status === "finished" && !finished.current) {
+              finished.current = true;
+              onFinished();
+            }
+          }
+        }
+      }
+    })().catch(() => {
+      if (stopped) return;
+      setStatus("error");
+      setFailure("轨迹连接中断");
+    });
+    return () => { stopped = true; controller.abort(); };
+  }, [agentId, runId]);
+  async function stop() {
+    setStopping(true);
+    setActionError("");
+    try {
+      await api(`/api/agents/${agentId}/runs/${runId}/cancel`, { method: "POST" });
+    } catch (reason) {
+      setActionError(errorText(reason));
+      setStopping(false);
+    }
+  }
+  return (
+    <div className="stack">
+      <div className="split">
+        <div className="meta">Agent 轨迹 · {stopping && live ? "正在停止" : (RUN_LABEL[status] ?? status)}</div>
+        {live && <button className="btn" type="button" onClick={() => { void stop(); }} disabled={stopping}>停止</button>}
+      </div>
+      {failure && <div className="alert">{failure}</div>}
+      {actionError && <div className="alert">{actionError}</div>}
+      <pre className="log trace" ref={box}>{log || "等待架构师开始"}</pre>
+    </div>
+  );
 }
 
 function SetupWizard({ project, projectId, manager, owner, step, onStep, onSaved }: { project: Project; projectId: string; manager: boolean; owner: boolean; step: number; onStep: (step: number) => void; onSaved: () => Promise<void> }) {

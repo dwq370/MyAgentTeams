@@ -1,5 +1,6 @@
 import { Injectable } from "@nestjs/common";
 import { DomainError } from "../domain/errors";
+import { createTraceFormatter } from "./cursor-trace";
 import { ListedModel, ModelSelection, modelChoices, selectModel } from "./model-selection";
 
 type TokenCounts = {
@@ -36,6 +37,17 @@ type SdkRun = {
   wait: () => Promise<{ status: string; result?: string; error?: { message?: string }; durationMs?: number; usage?: TokenCounts }>;
 };
 
+type CursorSendInput = {
+  apiKey: string;
+  model: ModelSelection;
+  prompt: string;
+  onText: (text: string) => Promise<void>;
+  onTrace?: (line: string) => Promise<void>;
+  onRunId: (runId: string) => Promise<void>;
+  onAgentId?: (agentId: string) => Promise<void>;
+  shouldCancel: () => Promise<boolean>;
+};
+
 type SdkAgent = {
   agentId: string;
   send: (prompt: string, options: unknown) => Promise<SdkRun>;
@@ -53,7 +65,6 @@ type SdkModule = {
       runs: { runId: string; usage: TokenCounts; cost?: UsageCost }[];
     }>;
   };
-  CursorAgentError: new (...args: never[]) => Error;
 };
 
 export interface CloudRepo {
@@ -65,6 +76,7 @@ export interface CursorRunOutcome {
   kind: "finished" | "run_error" | "startup_error" | "cancelled";
   runId?: string;
   message?: string;
+  code?: string;
   retryable?: boolean;
   helpUrl?: string;
   text?: string;
@@ -117,15 +129,7 @@ export class CursorPlatformAdapter {
     }
   }
 
-  async send(input: {
-    apiKey: string;
-    externalAgentId: string;
-    model: ModelSelection;
-    prompt: string;
-    onText: (text: string) => Promise<void>;
-    onRunId: (runId: string) => Promise<void>;
-    shouldCancel: () => Promise<boolean>;
-  }): Promise<CursorRunOutcome> {
+  async send(input: CursorSendInput & { externalAgentId: string }): Promise<CursorRunOutcome> {
     const sdk = await this.load();
     let agent: SdkAgent | undefined;
     try {
@@ -133,37 +137,97 @@ export class CursorPlatformAdapter {
         apiKey: input.apiKey,
         model: this.sdkModel(input.model),
       });
-      let active: SdkRun | null = null;
+      return await this.observe(agent, input);
+    } catch (error) {
+      return this.startup(error, input);
+    } finally {
+      await agent?.[Symbol.asyncDispose]().catch(() => undefined);
+    }
+  }
+
+  async sendFresh(input: CursorSendInput & { repos: CloudRepo[]; metadata: Record<string, string> }): Promise<CursorRunOutcome> {
+    const sdk = await this.load();
+    let agent: SdkAgent | undefined;
+    try {
+      agent = await sdk.Agent.create({
+        apiKey: input.apiKey,
+        model: this.sdkModel(input.model),
+        cloud: {
+          repos: input.repos.map((repo) => ({ url: repo.url, startingRef: repo.startingRef })),
+          metadata: input.metadata,
+        },
+      });
+      return await this.observe(agent, input, true);
+    } catch (error) {
+      return this.startup(error, input);
+    } finally {
+      await agent?.[Symbol.asyncDispose]().catch(() => undefined);
+    }
+  }
+
+  private async observe(agent: SdkAgent, input: CursorSendInput, fresh = false): Promise<CursorRunOutcome> {
+    let stopped = false;
+    let watching = Promise.resolve();
+    try {
+      let handle: SdkRun | null = null;
+      const tracer = createTraceFormatter();
       const run = await agent.send(input.prompt, {
         model: this.sdkModel(input.model),
         onDelta: async ({ update }: { update: { type?: string; text?: string } }) => {
+          const line = tracer.format(update);
+          if (line && input.onTrace) await input.onTrace(line);
           if (update?.type === "text-delta" && update.text) await input.onText(update.text);
-          if (active && (await input.shouldCancel()) && active.supports("cancel")) {
-            await active.cancel();
-          }
+          if (handle && (await input.shouldCancel()) && handle.supports("cancel")) await handle.cancel().catch(() => undefined);
         },
       });
-      active = run;
+      handle = run;
+      if (fresh && input.onAgentId) await input.onAgentId(agent.agentId);
       await input.onRunId(run.id);
-      if ((await input.shouldCancel()) && run.supports("cancel")) await run.cancel();
+      let cancelSent = false;
+      watching = (async () => {
+        while (!stopped) {
+          await delay(400);
+          if (stopped) return;
+          try {
+            if (await input.shouldCancel() && !cancelSent && run.supports("cancel")) {
+              cancelSent = true;
+              await run.cancel().catch(() => undefined);
+            }
+          } catch {
+            // Keep watching until the run ends.
+          }
+        }
+      })();
+      if ((await input.shouldCancel()) && run.supports("cancel")) {
+        cancelSent = true;
+        await run.cancel().catch(() => undefined);
+      }
       const result = await run.wait();
+      stopped = true;
+      await watching;
       const measured = { durationMs: result.durationMs, usage: this.usageFrom(result.usage) };
-      if (result.status === "cancelled") return { kind: "cancelled", runId: run.id, ...measured };
+      if (result.status === "cancelled" || await input.shouldCancel()) return { kind: "cancelled", runId: run.id, ...measured };
       if (result.status === "error") {
         return { kind: "run_error", runId: run.id, message: result.error?.message || "运行失败", ...measured };
       }
       return { kind: "finished", runId: run.id, text: result.result ?? "", ...measured };
     } catch (error) {
-      const helpUrl = typeof error === "object" && error && "helpUrl" in error ? String((error as { helpUrl?: string }).helpUrl) : undefined;
-      const retryable = typeof error === "object" && error && "isRetryable" in error ? Boolean((error as { isRetryable?: boolean }).isRetryable) : false;
-      const message = error instanceof Error ? error.message : "Cursor 启动失败";
-      if (this.isSdkError(error, sdk)) {
-        return { kind: "startup_error", message, retryable, helpUrl };
-      }
-      return { kind: "startup_error", message, retryable, helpUrl };
+      return this.startup(error, input);
     } finally {
-      await agent?.[Symbol.asyncDispose]().catch(() => undefined);
+      stopped = true;
+      await watching.catch(() => undefined);
     }
+  }
+
+  private async startup(error: unknown, input: { shouldCancel: () => Promise<boolean> }): Promise<CursorRunOutcome> {
+    if (await input.shouldCancel().catch(() => false)) return { kind: "cancelled" };
+    const helpUrl = typeof error === "object" && error && "helpUrl" in error ? String((error as { helpUrl?: string }).helpUrl) : undefined;
+    const retryable = typeof error === "object" && error && "isRetryable" in error ? Boolean((error as { isRetryable?: boolean }).isRetryable) : false;
+    const code = typeof error === "object" && error && "code" in error && typeof (error as { code?: unknown }).code === "string"
+      ? (error as { code: string }).code
+      : undefined;
+    const message = error instanceof Error ? error.message : "Cursor 启动失败";
+    return { kind: "startup_error", message, code, retryable, helpUrl };
   }
 
   async usage(apiKey: string, externalAgentId: string): Promise<CursorAgentUsage | null> {
@@ -219,13 +283,13 @@ export class CursorPlatformAdapter {
     }
   }
 
-  private isSdkError(error: unknown, sdk: SdkModule) {
-    return error instanceof sdk.CursorAgentError;
-  }
-
   private asDomain(error: unknown, fallback: string) {
     const message = error instanceof Error ? error.message : fallback;
     const helpUrl = typeof error === "object" && error && "helpUrl" in error ? (error as { helpUrl?: string }).helpUrl : undefined;
     return new DomainError(helpUrl ? `${message} ${helpUrl}` : message || fallback, 400);
   }
+}
+
+function delay(ms: number) {
+  return new Promise((resolve) => setTimeout(resolve, ms));
 }

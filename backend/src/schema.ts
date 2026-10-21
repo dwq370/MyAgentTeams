@@ -146,6 +146,8 @@ export const SCHEMA_STATEMENTS = [
     branch_origin varchar(16) NOT NULL DEFAULT 'baseline'
   )`,
   `ALTER TABLE agent_workspace ADD COLUMN IF NOT EXISTS branch_origin varchar(16) NOT NULL DEFAULT 'baseline'`,
+  `ALTER TABLE agent_workspace ADD COLUMN IF NOT EXISTS local_path text`,
+  `ALTER TABLE project ADD COLUMN IF NOT EXISTS architecture_description text NOT NULL DEFAULT ''`,
   `UPDATE agent_workspace SET branch_origin = 'created' WHERE forked = true AND branch_origin = 'baseline'`,
   `CREATE TABLE IF NOT EXISTS member_contact (
     id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
@@ -188,6 +190,8 @@ export const SCHEMA_STATEMENTS = [
     finished_at timestamptz
   )`,
   `ALTER TABLE agent_run ADD COLUMN IF NOT EXISTS usage jsonb`,
+  `ALTER TABLE agent_run ADD COLUMN IF NOT EXISTS purpose varchar(32) NOT NULL DEFAULT 'chat'`,
+  `ALTER TABLE agent_run ADD COLUMN IF NOT EXISTS target_project_id uuid`,
   `ALTER TABLE agent_run ADD COLUMN IF NOT EXISTS duration_ms integer`,
   `CREATE TABLE IF NOT EXISTS test_report (
     id uuid PRIMARY KEY DEFAULT gen_random_uuid(),

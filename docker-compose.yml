@@ -44,8 +44,10 @@ services:
       JWT_SECRET: dev-only-jwt-secret
       APP_ENCRYPTION_KEY: dev-only-change-me-please-32b
       KUBECONFIG: /root/.kube/config
+      REPO_ROOT: /var/agentteam/repos
     volumes:
       - ${USERPROFILE}/.kube:/root/.kube:ro
+      - repodata:/var/agentteam/repos
     extra_hosts:
       - "host.docker.internal:host-gateway"
       - "kubernetes.docker.internal:host-gateway"
@@ -74,6 +76,9 @@ services:
       REDIS_URL: redis://redis:6379
       JWT_SECRET: dev-only-jwt-secret
       APP_ENCRYPTION_KEY: dev-only-change-me-please-32b
+      REPO_ROOT: /var/agentteam/repos
+    volumes:
+      - repodata:/var/agentteam/repos
     ports:
       - "3001:3001"
     depends_on:
@@ -99,3 +104,4 @@ services:
 volumes:
   pgdata:
   redisdata:
+  repodata:

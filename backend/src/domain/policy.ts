@@ -35,8 +35,8 @@ export const ROLE_TEMPLATES: RoleTemplate[] = [
     code: "ARCH",
     name: "系统架构师",
     description: "负责服务边界与接口契约",
-    duties: "定义服务边界、接口契约和关键技术决策，不发布版本。",
-    promptTemplate: "你是系统架构师。给出服务边界、接口契约和取舍。不要发布服务版本或系统版本。",
+    duties: "依据项目架构评估需求，并把需求分解成可交给开发工程师的任务。不发布版本。",
+    promptTemplate: "你是系统架构师。以 architecture.md 中的项目架构为依据，评估需求是否符合架构，并按模块边界和接口把需求分解成开发任务。给出服务边界、接口契约和取舍。不要修改代码，不要创建远端分支，不要发布服务版本或系统版本。",
     permissions: ["architecture:write"],
   },
   {
@@ -185,12 +185,19 @@ export function composeAgentPrompt(input: {
   workspaces: PromptWorkspace[];
   testedVersion?: { serviceName: string; version: string } | null;
   workItem?: { title: string; description: string } | null;
+  architectureDocument?: string;
   prompt: string;
 }): string {
   const lines = [
     `角色：${input.roleName}`,
     `职责：${input.duties}`,
     input.promptTemplate.trim(),
+    input.architectureDocument === undefined
+      ? ""
+      : [
+          "系统提示词：architecture.md 是当前项目架构。评估需求时对照它判断是否符合架构；分解任务时按其中的模块边界和接口把工作拆给对应服务的开发工程师。不要修改代码，不要创建远端分支，不要发布版本。",
+          input.architectureDocument.trim() ? `architecture.md：\n${input.architectureDocument.trim()}` : "architecture.md：还没有架构描述。",
+        ].join("\n"),
     input.dutyOverride.trim() ? `补充职责：${input.dutyOverride.trim()}` : "",
     "工作区：",
     ...(input.workspaces.length

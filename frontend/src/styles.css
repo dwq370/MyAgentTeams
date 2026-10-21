@@ -62,6 +62,8 @@ textarea { min-height: 90px; resize: vertical; }
 .check-line { display: grid; grid-template-columns: 16px minmax(9rem, 34%) minmax(0, 1fr); column-gap: 12px; row-gap: 0; align-items: start; }
 .check-line span { min-width: 0; overflow-wrap: anywhere; }
 .source-repos { max-height: 240px; overflow: auto; display: grid; gap: 8px; margin-top: 8px; }
+.address-row { display: grid; grid-template-columns: minmax(0, 1fr) auto; gap: 12px; align-items: end; }
+.address-row .btn { margin-bottom: 2px; }
 table { width: 100%; border-collapse: collapse; }
 th, td { text-align: left; padding: 10px 8px; border-bottom: 1px solid var(--line); vertical-align: top; font-size: 14px; }
 .alert { background: #fff1ec; color: var(--rust); border-radius: 12px; padding: 10px 12px; }
@@ -71,6 +73,8 @@ th, td { text-align: left; padding: 10px 8px; border-bottom: 1px solid var(--lin
 .pill.good { background: #e5f6ee; color: var(--green); }
 .pill.wait { background: #fff3d8; color: var(--warn); }
 .log { white-space: pre-wrap; background: #14201c; color: #e7efe9; border-radius: 12px; padding: 12px; max-height: 280px; overflow: auto; }
+.log.trace { max-height: 420px; overflow-wrap: anywhere; }
+.doc { white-space: pre-wrap; background: var(--paper); border: 1px solid var(--line); border-radius: 12px; padding: 16px; max-height: 480px; overflow: auto; }
 .auth { min-height: 100vh; display: grid; place-items: center; padding: 24px; }
 .auth .card { width: min(440px, 100%); }
 .list { display: grid; gap: 10px; }

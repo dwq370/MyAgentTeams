@@ -1,4 +1,5 @@
 import { Injectable } from "@nestjs/common";
+import { ConfigService } from "@nestjs/config";
 import { InjectRepository } from "@nestjs/typeorm";
 import { Response } from "express";
 import { In, Repository } from "typeorm";
@@ -9,12 +10,14 @@ import {
   AgentEntity,
   AgentRunEntity,
   AgentWorkspaceEntity,
+  ProjectEntity,
   ProjectRoleEntity,
   ServiceEntity,
   ServiceVersionEntity,
   TeamMemberEntity,
   WorkItemEntity,
 } from "../entities";
+import { architectureDocument } from "../platform/architecture-file";
 import { GitRepoClient } from "../platform/git-repo";
 import { QueueService } from "../platform/queue.service";
 
@@ -26,10 +29,12 @@ export class AgentsService {
     private readonly access: AccessService,
     private readonly queue: QueueService,
     private readonly git: GitRepoClient,
+    private readonly config: ConfigService,
     @InjectRepository(AgentEntity) private readonly agents: Repository<AgentEntity>,
     @InjectRepository(AgentRunEntity) private readonly runs: Repository<AgentRunEntity>,
     @InjectRepository(AgentWorkspaceEntity) private readonly workspaces: Repository<AgentWorkspaceEntity>,
     @InjectRepository(TeamMemberEntity) private readonly members: Repository<TeamMemberEntity>,
+    @InjectRepository(ProjectEntity) private readonly projects: Repository<ProjectEntity>,
     @InjectRepository(ProjectRoleEntity) private readonly roles: Repository<ProjectRoleEntity>,
     @InjectRepository(ServiceEntity) private readonly services: Repository<ServiceEntity>,
     @InjectRepository(ServiceVersionEntity) private readonly versions: Repository<ServiceVersionEntity>,
@@ -57,6 +62,8 @@ export class AgentsService {
         roleSnapshot: {},
         status: "queued",
         log: "",
+        purpose: "chat",
+        targetProjectId: null,
       }),
     );
     await this.queue.enqueue({ kind: "send-run", runId: run.id }, `run-${run.id}`);
@@ -158,6 +165,10 @@ export class AgentsService {
       workItem = await this.workItems.findOne({ where: { id: workItemId, teamId: member.teamId } });
       if (!workItem) throw new DomainError("工作项不存在", 404);
     }
+    const project = role.permissions.includes("architecture:write")
+      ? await this.projects.findOne({ where: { id: team.projectId } })
+      : null;
+    const root = this.config.get<string>("REPO_ROOT") || "/var/agentteam/repos";
     const composedPrompt = composeAgentPrompt({
       roleName: role.name,
       duties: role.duties,
@@ -171,6 +182,9 @@ export class AgentsService {
       })),
       testedVersion,
       workItem: workItem ? { title: workItem.title, description: workItem.description } : null,
+      architectureDocument: role.permissions.includes("architecture:write")
+        ? await architectureDocument(root, team.projectId, project?.architectureDescription ?? "")
+        : undefined,
       prompt: options?.prompt ?? "",
     });
     return {

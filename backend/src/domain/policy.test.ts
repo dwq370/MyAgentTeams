@@ -80,6 +80,31 @@ describe("workspace and prompt", () => {
     assert.match(first, /旧职责/);
     assert.match(second, /新职责/);
     assert.equal(first.includes("新职责"), false);
+    assert.equal(first.includes("architecture.md"), false);
+  });
+
+  it("includes architecture.md in the architect prompt", () => {
+    const prompt = composeAgentPrompt({
+      roleName: "系统架构师",
+      duties: "评估需求",
+      promptTemplate: "你是系统架构师。",
+      dutyOverride: "",
+      workspaces: [],
+      architectureDocument: "# 上下文\nmageai 提供任务接口",
+      prompt: "评估这个需求",
+    });
+    assert.match(prompt, /architecture\.md：\n# 上下文/);
+    assert.match(prompt, /评估需求时对照它/);
+    const empty = composeAgentPrompt({
+      roleName: "系统架构师",
+      duties: "评估需求",
+      promptTemplate: "你是系统架构师。",
+      dutyOverride: "",
+      workspaces: [],
+      architectureDocument: "",
+      prompt: "评估这个需求",
+    });
+    assert.match(empty, /还没有架构描述/);
   });
 
   it("parses GitHub repositories", () => {

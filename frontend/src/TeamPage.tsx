@@ -29,7 +29,7 @@ function separateBranch(workspace: { branchOrigin?: string }) {
   return workspace.branchOrigin === "created" || workspace.branchOrigin === "selected";
 }
 
-type RepoLine = { action: string; name: string; repoUrl: string; branch: string };
+type RepoLine = { action: string; name: string; repoUrl: string; branch: string; keepRemote?: boolean };
 
 function RepoConfirmDialog({ title, lines, saving, error, onCancel, onConfirm }: {
   title: string;
@@ -52,6 +52,8 @@ function RepoConfirmDialog({ title, lines, saving, error, onCancel, onConfirm }:
             </div>
           ))}
         </div>
+        {lines.some((line) => line.action === "创建分支") && <p className="muted">确认后会把代码 clone 到本地，并创建同名的远端分支和本地分支。</p>}
+        {lines.some((line) => line.keepRemote) && <p className="muted">远端分支不会删除，请到 Git 上手动删除上面列出的分支。</p>}
         {error && <div className="alert">{error}</div>}
         <div className="row">
           <button className="btn primary" disabled={saving}>确认</button>
@@ -121,6 +123,8 @@ function Workspaces({ team, projectId, manager, onSaved }: { team: TeamItem; pro
   const [baselineRef, setBaselineRef] = useState("");
   const [error, setError] = useState("");
   const [ok, setOk] = useState("");
+  const [pendingDelete, setPendingDelete] = useState<TeamCatalog["addresses"][number] | null>(null);
+  const [deleting, setDeleting] = useState(false);
 
   async function load() {
     const [nextCatalog, environmentList] = await Promise.all([
@@ -179,10 +183,27 @@ function Workspaces({ team, projectId, manager, onSaved }: { team: TeamItem; pro
     setError("");
     setOk("");
     try {
-      await api(`/api/teams/${teamId}/sources/${sourceId}`, { method: "DELETE" });
-      setOk("代码来源已移除");
+      const result = await api<{ remoteBranchesKept?: KeptBranch[] }>(`/api/teams/${teamId}/sources/${sourceId}`, { method: "DELETE" });
+      setOk(removedNotice("代码来源已移除", result.remoteBranchesKept));
       await load();
     } catch (reason) { setError(errorText(reason)); }
+  }
+
+  async function removeAddress() {
+    if (!pendingDelete) return;
+    setError("");
+    setOk("");
+    setDeleting(true);
+    try {
+      const result = await api<{ remoteBranchesKept?: KeptBranch[] }>(`/api/teams/${teamId}/workspaces/${pendingDelete.serviceId}`, { method: "DELETE" });
+      setOk(removedNotice(`已移除 ${pendingDelete.name}`, result.remoteBranchesKept));
+      setPendingDelete(null);
+      await load();
+    } catch (reason) {
+      setError(errorText(reason));
+    } finally {
+      setDeleting(false);
+    }
   }
 
   async function saveBaselines(event: FormEvent) {
@@ -282,19 +303,48 @@ function Workspaces({ team, projectId, manager, onSaved }: { team: TeamItem; pro
       <p className="muted">这里是工作区里可直接分配的仓库。从群组勾选的仓库在保存 Agent 后也会出现在这里。</p>
       {(catalog?.addresses.length ?? 0) === 0 && <p className="muted">还没有仓库地址。</p>}
       {catalog?.addresses.map((address) => (
-        <label key={address.serviceId}>{address.name}
-          <span className="meta">{address.repoUrl}</span>
-          <input
-            value={baselines[address.serviceId] ?? address.baselineRef}
-            onChange={(event) => setBaselines({ ...baselines, [address.serviceId]: event.target.value })}
-            disabled={!manager}
-          />
-        </label>
+        <div className="address-row" key={address.serviceId}>
+          <label>{address.name}
+            <span className="meta">{address.repoUrl}</span>
+            <input
+              value={baselines[address.serviceId] ?? address.baselineRef}
+              onChange={(event) => setBaselines({ ...baselines, [address.serviceId]: event.target.value })}
+              disabled={!manager}
+            />
+          </label>
+          {manager && <button className="btn danger" type="button" onClick={() => setPendingDelete(address)}>删除</button>}
+        </div>
       ))}
       {manager && (catalog?.addresses.length ?? 0) > 0 && <button className="btn primary">保存基线</button>}
     </form>
+    {pendingDelete && (
+      <div className="modal-backdrop" onClick={() => { if (!deleting) setPendingDelete(null); }}>
+        <form className="card form modal" onClick={(event) => event.stopPropagation()} onSubmit={(event) => { event.preventDefault(); void removeAddress(); }}>
+          <h2>删除仓库</h2>
+          <div>
+            <strong>{pendingDelete.name}</strong>
+            <div className="meta">{pendingDelete.repoUrl}</div>
+            <div className="meta">基线 {pendingDelete.baselineRef}</div>
+          </div>
+          <p className="muted">确认后会从工作区移除这个仓库，并取消成员对它的分配。本地检出一并移除。成员单独使用的远端分支不会删除，请到 Git 上手动删除。</p>
+          {error && <div className="alert">{error}</div>}
+          <div className="row">
+            <button className="btn danger" disabled={deleting}>确认删除</button>
+            <button className="btn" type="button" disabled={deleting} onClick={() => setPendingDelete(null)}>取消</button>
+          </div>
+        </form>
+      </div>
+    )}
     </div>
   );
+}
+
+type KeptBranch = { memberName?: string; name: string; repoUrl: string; branch: string };
+
+function removedNotice(prefix: string, kept?: KeptBranch[]) {
+  if (!kept?.length) return prefix;
+  const branches = kept.map((item) => `${item.memberName ? `${item.memberName} · ` : ""}${item.branch}`).join("、");
+  return `${prefix}。远端分支未删除，请到 Git 上手动删除：${branches}`;
 }
 
 function Members({ teamId, teamName, projectId, manager, onTeamChanged }: { teamId: string; teamName: string; projectId: string; manager: boolean; onTeamChanged: () => Promise<void> }) {
@@ -364,9 +414,8 @@ function MemberCard({ member, peers, teamId, teamName, catalog, versions, manage
   const [contactIds, setContactIds] = useState<string[]>([]);
   const [contactError, setContactError] = useState("");
   const [removing, setRemoving] = useState(false);
-  const [deleteBranches, setDeleteBranches] = useState(false);
   const [removeError, setRemoveError] = useState("");
-  const [branchToDelete, setBranchToDelete] = useState("");
+  const [notice, setNotice] = useState("");
   const [reposOpen, setReposOpen] = useState(false);
   const ownedBranches = member.agent?.workspaces.filter(separateBranch) ?? [];
 
@@ -425,7 +474,6 @@ function MemberCard({ member, peers, teamId, teamName, catalog, versions, manage
   }
 
   function openRemove() {
-    setDeleteBranches(false);
     setRemoveError("");
     setRemoving(true);
   }
@@ -435,27 +483,11 @@ function MemberCard({ member, peers, teamId, teamName, catalog, versions, manage
     setSaving(true);
     setRemoveError("");
     try {
-      const drop = deleteBranches && ownedBranches.length > 0;
-      await api(`/api/teams/${teamId}/members/${member.id}?deleteBranches=${drop ? "true" : "false"}`, { method: "DELETE" });
+      await api(`/api/teams/${teamId}/members/${member.id}`, { method: "DELETE" });
       setRemoving(false);
       await onChanged();
     } catch (reason) {
       setRemoveError(errorText(reason));
-    } finally {
-      setSaving(false);
-    }
-  }
-
-  async function confirmDeleteBranch(event: FormEvent) {
-    event.preventDefault();
-    setSaving(true);
-    try {
-      await api(`/api/teams/${teamId}/members/${member.id}/workspaces/${branchToDelete}/branch`, { method: "DELETE" });
-      setBranchToDelete("");
-      await onChanged();
-    } catch (reason) {
-      onError(errorText(reason));
-      setBranchToDelete("");
     } finally {
       setSaving(false);
     }
@@ -499,17 +531,16 @@ function MemberCard({ member, peers, teamId, teamName, catalog, versions, manage
         <span className={`pill ${statusClass}`}>{member.status}</span>
       </div>
       {member.failureReason && <div className="alert">{member.failureReason}</div>}
+      {notice && <div className="alert">{notice}</div>}
       {member.dutyOverride && <p className="chat-text">{member.dutyOverride}</p>}
       <p className="meta">可沟通：{member.contacts.length ? member.contacts.map((item) => item.name).join("、") : "未添加"}</p>
       {member.agent && (
         <div className="meta">
           {member.agent.platform} / {member.agent.model} / {member.agent.externalAgentId || "尚未创建外部 Agent"}
           {member.agent.workspaces.map((workspace) => (
-            <div key={workspace.id} className="split">
-              <span>{separateBranch(workspace) ? "分支" : "基线"} {workspace.branch} · {workspace.forkStatus === "planned" ? "创建中" : workspace.forkStatus === "failed" ? "失败" : "就绪"}</span>
-              {manager && separateBranch(workspace) && member.status !== "pending" && (
-                <button className="btn" type="button" onClick={() => setBranchToDelete(workspace.id)}>删除分支</button>
-              )}
+            <div key={workspace.id}>
+              {separateBranch(workspace) ? "分支" : "基线"} {workspace.branch} · {workspace.forkStatus === "planned" ? "创建中" : workspace.forkStatus === "failed" ? "失败" : "就绪"}
+              {workspace.localPath ? " · 本地分支已创建" : ""}
             </div>
           ))}
         </div>
@@ -569,29 +600,13 @@ function MemberCard({ member, peers, teamId, teamName, catalog, versions, manage
           <form className="card form modal" onClick={(event) => event.stopPropagation()} onSubmit={confirmRemove}>
             <h2>移除 {member.name}</h2>
             {ownedBranches.length > 0 && (
-              <label className="check-line">
-                <input type="checkbox" checked={deleteBranches} onChange={(event) => setDeleteBranches(event.target.checked)} />
-                <span>同时删除分支</span>
-                <span className="muted">{ownedBranches.map((workspace) => workspace.branch).join("、")}</span>
-              </label>
+              <p>远端分支不会删除，请到 Git 上手动删除：{ownedBranches.map((workspace) => workspace.branch).join("、")}</p>
             )}
             {ownedBranches.length === 0 && <p className="muted">这个成员没有单独分支。</p>}
             {removeError && <div className="alert">{removeError}</div>}
             <div className="row">
               <button className="btn danger" disabled={saving}>确认移除</button>
               <button className="btn" type="button" disabled={saving} onClick={() => setRemoving(false)}>取消</button>
-            </div>
-          </form>
-        </div>
-      )}
-      {branchToDelete && (
-        <div className="modal-backdrop" onClick={() => { if (!saving) setBranchToDelete(""); }}>
-          <form className="card form modal" onClick={(event) => event.stopPropagation()} onSubmit={confirmDeleteBranch}>
-            <h2>删除分支</h2>
-            <p>删除远程分支 {member.agent?.workspaces.find((workspace) => workspace.id === branchToDelete)?.branch}。成员会改回使用工作区基线。</p>
-            <div className="row">
-              <button className="btn danger" disabled={saving}>删除分支</button>
-              <button className="btn" type="button" disabled={saving} onClick={() => setBranchToDelete("")}>取消</button>
             </div>
           </form>
         </div>
@@ -615,7 +630,7 @@ function MemberCard({ member, peers, teamId, teamName, catalog, versions, manage
           member={member}
           catalog={catalog}
           onClose={() => { if (!saving) setReposOpen(false); }}
-          onSaved={async () => { setReposOpen(false); await onChanged(); }}
+          onSaved={async (message) => { setReposOpen(false); setNotice(message ?? ""); await onChanged(); }}
         />
       )}
     </article>
@@ -628,7 +643,7 @@ function RepoEditor({ teamId, teamName, member, catalog, onClose, onSaved }: {
   member: MemberItem;
   catalog: TeamCatalog | null;
   onClose: () => void;
-  onSaved: () => Promise<void>;
+  onSaved: (notice?: string) => Promise<void>;
 }) {
   const [serviceIds, setServiceIds] = useState<string[]>(member.serviceIds);
   const [groupRepos, setGroupRepos] = useState<{ sourceId: string; repoUrl: string }[]>([]);
@@ -733,10 +748,11 @@ function RepoEditor({ teamId, teamName, member, catalog, onClose, onSaved }: {
       ...removed.map((service) => {
         const workspace = member.agent?.workspaces.find((item) => item.serviceId === service.id);
         return {
-          action: workspace && separateBranch(workspace) ? "删除分支" : "移出代码仓",
+          action: "移出代码仓",
           name: service.name,
           repoUrl: service.repoUrl,
           branch: workspace?.branch ?? catalog?.addresses.find((address) => address.serviceId === service.id)?.baselineRef ?? "基线",
+          keepRemote: Boolean(workspace && separateBranch(workspace)),
         };
       }),
       ...added.map((pick) => ({
@@ -759,11 +775,13 @@ function RepoEditor({ teamId, teamName, member, catalog, onClose, onSaved }: {
           ? { create: true, mode: branchMode, name: branchMode === "custom" ? branchLeaf.trim() : undefined, existing: branchMode === "existing" ? selectedRepos().filter((pick) => !pick.serviceId || !member.serviceIds.includes(pick.serviceId)).map((pick) => ({ serviceId: pick.serviceId, repoUrl: pick.repoUrl, branch: existingBranches[pick.key] })) : undefined }
           : { create: false })
         : { create: false };
-      await api(`/api/teams/${teamId}/members/${member.id}/repos`, {
+      const result = await api<{ remoteBranchesKept?: { name: string; branch: string }[] }>(`/api/teams/${teamId}/members/${member.id}/repos`, {
         method: "PUT",
         body: JSON.stringify({ serviceIds, groupRepos, branch }),
       });
-      await onSaved();
+      const kept = result.remoteBranchesKept ?? [];
+      const message = kept.length ? `远端分支未删除，请到 Git 上手动删除：${kept.map((item) => `${item.name} ${item.branch}`).join("、")}` : undefined;
+      await onSaved(message);
     } catch (reason) {
       setError(errorText(reason));
       setConfirmLines(null);

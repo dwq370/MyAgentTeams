@@ -39,6 +39,9 @@ export class ProjectEntity {
   @Column({ type: "text", default: "" })
   description: string;
 
+  @Column({ name: "architecture_description", type: "text", default: "" })
+  architectureDescription: string;
+
   @Column({ name: "owner_id", type: "uuid" })
   ownerId: string;
 
@@ -453,6 +456,9 @@ export class AgentWorkspaceEntity {
 
   @Column({ name: "git_sha", type: "varchar", nullable: true })
   gitSha: string | null;
+
+  @Column({ name: "local_path", type: "text", nullable: true })
+  localPath: string | null;
 }
 
 @Entity("member_contact")
@@ -559,6 +565,12 @@ export class AgentRunEntity {
 
   @Column({ type: "text", default: "" })
   log: string;
+
+  @Column({ default: "chat" })
+  purpose: "chat" | "architecture";
+
+  @Column({ name: "target_project_id", type: "uuid", nullable: true })
+  targetProjectId: string | null;
 
   @Column({ type: "jsonb", nullable: true })
   usage: RunUsageSnapshot | null;

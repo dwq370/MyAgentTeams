@@ -8,6 +8,7 @@ import { canonicalRepoUrl, invalidGroupMessage, parseGitGroup, parseGitRepo, Rem
 import { ServiceEntity } from "../entities";
 import { GitHubClient } from "./github";
 import { GitLabClient } from "./gitlab";
+import { LocalGit } from "./local-git";
 
 @Injectable()
 export class GitRepoClient {
@@ -15,6 +16,7 @@ export class GitRepoClient {
     private readonly config: ConfigService,
     private readonly github: GitHubClient,
     private readonly gitlab: GitLabClient,
+    private readonly localGit: LocalGit,
     @InjectRepository(ServiceEntity) private readonly services: Repository<ServiceEntity>,
   ) {}
 
@@ -79,14 +81,21 @@ export class GitRepoClient {
     return this.gitlab.listBranches(repo, token);
   }
 
-  async deleteBranch(serviceId: string, repoUrl: string, branch: string, options?: { required?: boolean }) {
-    const token = options?.required
-      ? await this.requireToken(serviceId, "未配置 Git 访问令牌，无法删除分支")
-      : await this.tokenFor(serviceId);
-    if (!token) return;
-    const repo = this.parse(repoUrl);
-    if (repo.host === "github") await this.github.deleteBranch(token, repoUrl, branch);
-    else await this.gitlab.deleteBranch(repo, token, branch);
+  async checkoutLocal(key: string, serviceId: string, repoUrl: string, branch: string) {
+    const token = await this.requireToken(serviceId, "未配置 Git 访问令牌，无法 clone 代码仓");
+    return this.localGit.checkout(key, repoUrl, token, branch);
+  }
+
+  async removeLocal(localPath: string | null | undefined) {
+    await this.localGit.remove(localPath);
+  }
+
+  summarizeLocal(localPath: string, name: string, repoUrl: string, branch: string) {
+    return this.localGit.summarize(localPath, name, repoUrl, branch);
+  }
+
+  readSourceLocal(localPath: string, name: string, repoUrl: string, branch: string) {
+    return this.localGit.readSource(localPath, name, repoUrl, branch);
   }
 
   async createTag(serviceId: string, repoUrl: string, tag: string, sha: string) {

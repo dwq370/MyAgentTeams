@@ -73,6 +73,15 @@ export class TeamsController {
     return this.teams.removeSource(user.id, teamId, sourceId);
   }
 
+  @Delete("teams/:teamId/workspaces/:serviceId")
+  removeWorkspace(
+    @CurrentUser() user: AuthUser,
+    @Param("teamId") teamId: string,
+    @Param("serviceId") serviceId: string,
+  ) {
+    return this.teams.removeWorkspace(user.id, teamId, serviceId);
+  }
+
   @Patch("teams/:teamId/workspaces")
   updateBaselines(
     @CurrentUser() user: AuthUser,
@@ -147,24 +156,13 @@ export class TeamsController {
     return this.teams.updateContacts(user.id, teamId, memberId, body.memberIds);
   }
 
-  @Delete("teams/:teamId/members/:memberId/workspaces/:workspaceId/branch")
-  deleteBranch(
-    @CurrentUser() user: AuthUser,
-    @Param("teamId") teamId: string,
-    @Param("memberId") memberId: string,
-    @Param("workspaceId") workspaceId: string,
-  ) {
-    return this.teams.deleteMemberBranch(user.id, teamId, memberId, workspaceId);
-  }
-
   @Delete("teams/:teamId/members/:memberId")
   removeMember(
     @CurrentUser() user: AuthUser,
     @Param("teamId") teamId: string,
     @Param("memberId") memberId: string,
-    @Query("deleteBranches") deleteBranches?: string,
   ) {
-    return this.teams.removeMember(user.id, teamId, memberId, deleteBranches === "true");
+    return this.teams.removeMember(user.id, teamId, memberId);
   }
 
   @Post("agents/:agentId/retry")

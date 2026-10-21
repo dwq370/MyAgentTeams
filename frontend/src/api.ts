@@ -59,6 +59,7 @@ export interface Project {
   id: string;
   name: string;
   description: string;
+  architectureDescription?: string;
   projectRole: "owner" | "admin" | "member";
   createdAt: string;
   counts?: { services: number; roles: number; teams: number; members: number; environments: number };
@@ -216,6 +217,7 @@ export interface MemberItem {
       forked: boolean;
       forkStatus: string;
       branchOrigin?: "baseline" | "created" | "selected";
+      localPath?: string | null;
     }[];
   };
 }
