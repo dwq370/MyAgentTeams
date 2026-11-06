@@ -147,6 +147,9 @@ export const SCHEMA_STATEMENTS = [
   )`,
   `ALTER TABLE agent_workspace ADD COLUMN IF NOT EXISTS branch_origin varchar(16) NOT NULL DEFAULT 'baseline'`,
   `ALTER TABLE agent_workspace ADD COLUMN IF NOT EXISTS local_path text`,
+  `ALTER TABLE team_workspace ADD COLUMN IF NOT EXISTS baseline_source varchar(200)`,
+  `ALTER TABLE team_workspace ADD COLUMN IF NOT EXISTS local_path text`,
+  `ALTER TABLE team_workspace ADD COLUMN IF NOT EXISTS git_sha varchar(64)`,
   `ALTER TABLE project ADD COLUMN IF NOT EXISTS architecture_description text NOT NULL DEFAULT ''`,
   `UPDATE agent_workspace SET branch_origin = 'created' WHERE forked = true AND branch_origin = 'baseline'`,
   `CREATE TABLE IF NOT EXISTS member_contact (

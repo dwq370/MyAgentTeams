@@ -18,9 +18,12 @@ export class LocalGit {
     return this.config.get<string>("REPO_ROOT") || "/var/agentteam/repos";
   }
 
-  async checkout(key: string, repoUrl: string, token: string, branch: string) {
+  async checkout(key: string, repoUrl: string, token: string, branch: string, fromRemote?: string, recreate = false) {
     this.assertKey(key);
     this.assertBranch(branch);
+    const remoteBranch = fromRemote?.trim() || "";
+    if (remoteBranch) this.assertBranch(remoteBranch);
+    const tracked = remoteBranch || branch;
     const localPath = this.resolveKey(key);
     const cleanUrl = canonicalRepoUrl(repoUrl) ?? repoUrl;
     const header = this.authHeader(cleanUrl, token);
@@ -34,10 +37,15 @@ export class LocalGit {
     if (!ready) {
       await fs.rm(localPath, { recursive: true, force: true });
       await fs.mkdir(path.dirname(localPath), { recursive: true });
-      await this.git(["clone", "--branch", branch, "--single-branch", cleanUrl, localPath], { header });
+      await this.git(["clone", "--branch", tracked, "--single-branch", cleanUrl, localPath], { header });
     } else {
-      await this.git(["fetch", "origin", branch], { cwd: localPath, header });
-      await this.git(["checkout", "-B", branch, "FETCH_HEAD"], { cwd: localPath });
+      await this.git(["fetch", "origin", tracked], { cwd: localPath, header });
+      if (!remoteBranch) await this.git(["checkout", "-B", branch, "FETCH_HEAD"], { cwd: localPath });
+    }
+    if (remoteBranch) {
+      const hasBranch = !recreate && await this.hasLocalBranch(localPath, branch);
+      if (hasBranch) await this.git(["checkout", branch], { cwd: localPath });
+      else await this.git(["checkout", "-B", branch, ready ? "FETCH_HEAD" : "HEAD"], { cwd: localPath });
     }
     const current = (await this.git(["rev-parse", "--abbrev-ref", "HEAD"], { cwd: localPath })).stdout.trim();
     if (current !== branch) throw new DomainError(`本地分支应为 ${branch}`);
@@ -175,8 +183,16 @@ export class LocalGit {
     return false;
   }
 
+  private async hasLocalBranch(localPath: string, branch: string) {
+    return new Promise<boolean>((resolve, reject) => {
+      const child = spawn("git", ["show-ref", "--verify", "--quiet", `refs/heads/${branch}`], { cwd: localPath });
+      child.on("error", () => reject(new DomainError("git 执行失败")));
+      child.on("close", (code) => resolve(code === 0));
+    });
+  }
+
   private assertKey(key: string) {
-    if (!/^(workspaces\/[0-9a-f-]{36}|projects\/[0-9a-f-]{36}\/[0-9a-f-]{36})$/.test(key)) {
+    if (!/^(workspaces\/[0-9a-f-]{36}|projects\/[0-9a-f-]{36}\/[0-9a-f-]{36}|teams\/[0-9a-f-]{36}\/[0-9a-f-]{36})$/.test(key)) {
       throw new DomainError("本地目录无效");
     }
   }

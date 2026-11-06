@@ -129,6 +129,7 @@ export class TeamsService {
 
   async remove(userId: string, teamId: string) {
     await this.access.requireTeam(userId, teamId, "admin");
+    const locals = await this.workspaces.find({ where: { teamId } });
     const releases = await this.dataSource.query(`SELECT count(*)::int AS count FROM system_release WHERE team_id = $1`, [
       teamId,
     ]);
@@ -157,6 +158,7 @@ export class TeamsService {
       await manager.query(`DELETE FROM team_workspace WHERE team_id = $1`, [teamId]);
       await manager.query(`DELETE FROM team WHERE id = $1`, [teamId]);
     });
+    for (const row of locals) await this.git.removeLocal(row.localPath).catch(() => undefined);
     return { ok: true };
   }
 
@@ -221,23 +223,44 @@ export class TeamsService {
     return this.listWorkspaces(userId, teamId);
   }
 
-  async updateBaselines(userId: string, teamId: string, items: { serviceId: string; baselineRef: string }[]) {
-    await this.access.requireTeam(userId, teamId, "admin");
+  async updateBaselines(userId: string, teamId: string, items: { serviceId: string; baselineRef: string; fromRemote?: string }[]) {
+    const { team } = await this.access.requireTeam(userId, teamId, "admin");
     const current = await this.workspaces.find({ where: { teamId } });
     const byService = new Map(current.map((row) => [row.serviceId, row]));
+    const services = items.length
+      ? await this.services.find({ where: { id: In(items.map((item) => item.serviceId)), projectId: team.projectId } })
+      : [];
     for (const item of items) {
-      if (!byService.has(item.serviceId)) throw new DomainError("服务不在 Team 工作区中");
+      const row = byService.get(item.serviceId);
+      if (!row) throw new DomainError("服务不在 Team 工作区中");
       const baseline = item.baselineRef.trim();
-      if (!/^[A-Za-z0-9._/-]{1,200}$/.test(baseline)) throw new DomainError("分支或 tag 含有不支持的字符");
-    }
-    await this.dataSource.transaction(async (manager) => {
-      for (const item of items) {
-        const row = byService.get(item.serviceId);
-        if (!row) continue;
-        row.baselineRef = item.baselineRef.trim();
-        await manager.save(row);
+      const fromRemote = item.fromRemote?.trim() || "";
+      if (!/^[A-Za-z0-9._/-]{1,200}$/.test(baseline) || (fromRemote && !/^[A-Za-z0-9._/-]{1,200}$/.test(fromRemote))) {
+        throw new DomainError("分支或 tag 含有不支持的字符");
       }
-    });
+      const service = services.find((candidate) => candidate.id === item.serviceId);
+      if (!service) throw new DomainError("服务不存在", 404);
+      if (!fromRemote) {
+        if (row.baselineSource && row.localPath) await this.git.removeLocal(row.localPath).catch(() => undefined);
+        row.baselineRef = baseline;
+        row.baselineSource = null;
+        row.localPath = null;
+        row.gitSha = null;
+        await this.workspaces.save(row);
+        continue;
+      }
+      if (fromRemote === baseline) throw new DomainError("本地分支名要和远端分支不同，已有分支直接填写");
+      const branches = await this.git.listBranches(service.id, service.repoUrl);
+      if (!branches.includes(fromRemote)) throw new DomainError(`远端没有分支 ${fromRemote}`);
+      if (branches.includes(baseline)) throw new DomainError(`远端已有分支 ${baseline}，请直接填写这个已有分支`);
+      const recreate = Boolean(row.localPath && row.baselineRef === baseline && row.baselineSource !== fromRemote);
+      const local = await this.git.checkoutLocal(`teams/${teamId}/${service.id}`, service.id, service.repoUrl, baseline, fromRemote, recreate);
+      row.baselineRef = baseline;
+      row.baselineSource = fromRemote;
+      row.localPath = local.localPath;
+      row.gitSha = local.sha;
+      await this.workspaces.save(row);
+    }
     return this.listWorkspaces(userId, teamId);
   }
 
@@ -284,6 +307,7 @@ export class TeamsService {
       if (matched.length) await manager.delete(TeamSourceEntity, { id: In(matched.map((source) => source.id)) });
     });
     for (const row of rows) await this.git.removeLocal(row.localPath).catch(() => undefined);
+    await this.git.removeLocal(workspace.localPath).catch(() => undefined);
     for (const agent of affectedAgents) {
       await this.agents.update(agent.id, { externalAgentId: null, status: "pending" });
       await this.members.update(agent.memberId, { status: "pending", failureReason: null });
@@ -306,6 +330,7 @@ export class TeamsService {
       name: workspace.serviceName,
       repoUrl: workspace.repoUrl,
       baselineRef: workspace.baselineRef,
+      baselineSource: workspace.baselineSource,
     }));
     const serviceByRepo = new Map(addresses.map((address) => [repoIdentity(address.repoUrl), address.serviceId]));
     const groups: {
@@ -741,7 +766,9 @@ export class TeamsService {
     try {
       for (const row of planned) {
         if (row.branchOrigin !== "created") continue;
-        const result = await this.git.ensureBranch(row.serviceId, row.repoUrl, row.baselineRef, row.branch);
+        const parent = teamWorkspaces.find((item) => item.id === row.parentWorkspaceId);
+        const remoteBase = parent?.baselineSource && parent.baselineRef === row.baselineRef ? parent.baselineSource : row.baselineRef;
+        const result = await this.git.ensureBranch(row.serviceId, row.repoUrl, remoteBase, row.branch);
         row.gitSha = result.sha;
         if (result.created) made.push(row);
       }

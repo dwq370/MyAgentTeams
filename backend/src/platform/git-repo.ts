@@ -81,9 +81,9 @@ export class GitRepoClient {
     return this.gitlab.listBranches(repo, token);
   }
 
-  async checkoutLocal(key: string, serviceId: string, repoUrl: string, branch: string) {
+  async checkoutLocal(key: string, serviceId: string, repoUrl: string, branch: string, fromRemote?: string, recreate = false) {
     const token = await this.requireToken(serviceId, "未配置 Git 访问令牌，无法 clone 代码仓");
-    return this.localGit.checkout(key, repoUrl, token, branch);
+    return this.localGit.checkout(key, repoUrl, token, branch, fromRemote, recreate);
   }
 
   async removeLocal(localPath: string | null | undefined) {

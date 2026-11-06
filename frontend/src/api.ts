@@ -170,6 +170,7 @@ export interface WorkspaceItem {
   serviceName: string;
   repoUrl: string;
   baselineRef: string;
+  baselineSource?: string | null;
 }
 
 export interface TeamSource {
@@ -190,7 +191,7 @@ export interface CatalogRepo {
 
 export interface TeamCatalog {
   sources: TeamSource[];
-  addresses: { serviceId: string; name: string; repoUrl: string; baselineRef: string }[];
+  addresses: { serviceId: string; name: string; repoUrl: string; baselineRef: string; baselineSource?: string | null }[];
   groups: { id: string; name: string; url: string; error: string | null; repos: CatalogRepo[] }[];
 }
 

@@ -317,6 +317,15 @@ export class TeamWorkspaceEntity {
 
   @Column({ name: "baseline_ref" })
   baselineRef: string;
+
+  @Column({ name: "baseline_source", type: "varchar", length: 200, nullable: true })
+  baselineSource: string | null;
+
+  @Column({ name: "local_path", type: "text", nullable: true })
+  localPath: string | null;
+
+  @Column({ name: "git_sha", type: "varchar", length: 64, nullable: true })
+  gitSha: string | null;
 }
 
 @Entity("service_version")

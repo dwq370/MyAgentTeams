@@ -62,7 +62,7 @@ textarea { min-height: 90px; resize: vertical; }
 .check-line { display: grid; grid-template-columns: 16px minmax(9rem, 34%) minmax(0, 1fr); column-gap: 12px; row-gap: 0; align-items: start; }
 .check-line span { min-width: 0; overflow-wrap: anywhere; }
 .source-repos { max-height: 240px; overflow: auto; display: grid; gap: 8px; margin-top: 8px; }
-.address-row { display: grid; grid-template-columns: minmax(0, 1fr) auto; gap: 12px; align-items: end; }
+.address-row { display: grid; grid-template-columns: minmax(0, 1fr) auto; gap: 12px; align-items: start; }
 .address-row .btn { margin-bottom: 2px; }
 table { width: 100%; border-collapse: collapse; }
 th, td { text-align: left; padding: 10px 8px; border-bottom: 1px solid var(--line); vertical-align: top; font-size: 14px; }

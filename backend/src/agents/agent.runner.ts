@@ -93,7 +93,8 @@ export class AgentJobRunner implements OnModuleInit, OnModuleDestroy {
       if (!secrets.apiKey) throw new Error("未配置 Cursor API Key");
       for (const workspace of rows) {
         if (workspace.branchOrigin === "created" && workspace.forkStatus === "planned") {
-          const result = await this.git.ensureBranch(workspace.serviceId, workspace.repoUrl, workspace.baselineRef, workspace.branch);
+          const remoteBase = (await this.remoteBaseline(workspace)) ?? workspace.baselineRef;
+          const result = await this.git.ensureBranch(workspace.serviceId, workspace.repoUrl, remoteBase, workspace.branch);
           workspace.forkStatus = "ready";
           workspace.gitSha = result.sha;
         }
@@ -102,7 +103,14 @@ export class AgentJobRunner implements OnModuleInit, OnModuleDestroy {
             await this.workspaces.save(workspace);
             continue;
           }
-          const local = await this.git.checkoutLocal(`workspaces/${workspace.id}`, workspace.serviceId, workspace.repoUrl, workspace.branch);
+          const fromRemote = workspace.branchOrigin === "baseline" ? await this.remoteBaseline(workspace) : null;
+          const local = await this.git.checkoutLocal(
+            `workspaces/${workspace.id}`,
+            workspace.serviceId,
+            workspace.repoUrl,
+            workspace.branch,
+            fromRemote ?? undefined,
+          );
           workspace.localPath = local.localPath;
           workspace.gitSha = local.sha || workspace.gitSha;
         } catch (error) {
@@ -113,7 +121,7 @@ export class AgentJobRunner implements OnModuleInit, OnModuleDestroy {
       const externalAgentId = await this.cursor.createAgent({
         apiKey: secrets.apiKey,
         model: await this.cursor.resolveModel(secrets.apiKey, agent.model),
-        repos: rows.map((workspace) => ({ url: workspace.repoUrl, startingRef: workspace.branch })),
+        repos: await Promise.all(rows.map(async (workspace) => ({ url: workspace.repoUrl, startingRef: await this.cloudRef(workspace) }))),
         metadata: {
           agent_id: agent.id,
           team_id: team.id,
@@ -243,6 +251,19 @@ export class AgentJobRunner implements OnModuleInit, OnModuleDestroy {
     }
   }
 
+  private async cloudRef(workspace: AgentWorkspaceEntity) {
+    if (workspace.branchOrigin !== "baseline") return workspace.branch;
+    return (await this.remoteBaseline(workspace)) ?? workspace.branch;
+  }
+
+  private async remoteBaseline(workspace: AgentWorkspaceEntity) {
+    if (!workspace.parentWorkspaceId) return null;
+    const parent = await this.teamWorkspaces.findOne({ where: { id: workspace.parentWorkspaceId } });
+    if (!parent?.baselineSource) return null;
+    if (parent.baselineRef !== workspace.baselineRef && parent.baselineRef !== workspace.branch) return null;
+    return parent.baselineSource;
+  }
+
   private agentMissing(outcome: { kind: string; code?: string; message?: string }) {
     return outcome.kind === "startup_error" && (outcome.code === "agent_not_found" || Boolean(outcome.message?.includes("agent_not_found")));
   }
@@ -299,7 +320,7 @@ export class AgentJobRunner implements OnModuleInit, OnModuleDestroy {
     if (!agent || !team) return null;
     const rows = await this.workspaces.find({ where: { agentId } });
     return {
-      repos: rows.map((workspace) => ({ url: workspace.repoUrl, startingRef: workspace.branch })),
+      repos: await Promise.all(rows.map(async (workspace) => ({ url: workspace.repoUrl, startingRef: await this.cloudRef(workspace) }))),
       metadata: { agent_id: agent.id, team_id: team.id, project_id: team.projectId },
     };
   }
@@ -488,7 +509,13 @@ export class AgentJobRunner implements OnModuleInit, OnModuleDestroy {
       await this.appendLog(runId, `正在检出 ${service.name} @ ${workspace.baselineRef}\n`);
       let source: Awaited<ReturnType<GitRepoClient["readSourceLocal"]>>;
       try {
-        const local = await this.git.checkoutLocal(`projects/${projectId}/${service.id}`, service.id, service.repoUrl, workspace.baselineRef);
+        const local = await this.git.checkoutLocal(
+          `projects/${projectId}/${service.id}`,
+          service.id,
+          service.repoUrl,
+          workspace.baselineRef,
+          workspace.baselineSource ?? undefined,
+        );
         source = await this.git.readSourceLocal(local.localPath, service.name, service.repoUrl, workspace.baselineRef);
       } catch (error) {
         const message = error instanceof Error ? error.message : "检出失败";

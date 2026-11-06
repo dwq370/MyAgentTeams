@@ -49,6 +49,11 @@ export class WorkspaceItemDto {
   @MinLength(1)
   @MaxLength(200)
   baselineRef: string;
+
+  @IsOptional()
+  @IsString()
+  @MaxLength(200)
+  fromRemote?: string;
 }
 
 export class ReplaceWorkspacesDto {

@@ -121,6 +121,9 @@ function Workspaces({ team, projectId, manager, onSaved }: { team: TeamItem; pro
   const [environments, setEnvironments] = useState<TestEnvironment[]>([]);
   const [environmentId, setEnvironmentId] = useState(team.testEnvironment?.id ?? "");
   const [baselines, setBaselines] = useState<Record<string, string>>({});
+  const [baselineMode, setBaselineMode] = useState<Record<string, "existing" | "create">>({});
+  const [baselineFrom, setBaselineFrom] = useState<Record<string, string>>({});
+  const [remoteBranches, setRemoteBranches] = useState<Record<string, string[]>>({});
   const [kind, setKind] = useState<"group" | "repo">("group");
   const [url, setUrl] = useState("");
   const [gitToken, setGitToken] = useState("");
@@ -138,8 +141,16 @@ function Workspaces({ team, projectId, manager, onSaved }: { team: TeamItem; pro
     setCatalog(nextCatalog);
     setEnvironments(environmentList);
     const next: Record<string, string> = {};
-    for (const address of nextCatalog.addresses) next[address.serviceId] = address.baselineRef;
+    const modes: Record<string, "existing" | "create"> = {};
+    const froms: Record<string, string> = {};
+    for (const address of nextCatalog.addresses) {
+      next[address.serviceId] = address.baselineRef;
+      modes[address.serviceId] = address.baselineSource ? "create" : "existing";
+      froms[address.serviceId] = address.baselineSource ?? "";
+    }
     setBaselines(next);
+    setBaselineMode(modes);
+    setBaselineFrom(froms);
   }
 
   useEffect(() => {
@@ -210,15 +221,50 @@ function Workspaces({ team, projectId, manager, onSaved }: { team: TeamItem; pro
     }
   }
 
+  async function loadRemoteBranches(serviceId: string) {
+    if (remoteBranches[serviceId]) return;
+    try {
+      const result = await api<{ branches: string[] }>(`/api/teams/${teamId}/branches?serviceId=${serviceId}`);
+      setRemoteBranches((current) => ({ ...current, [serviceId]: result.branches }));
+      setBaselineFrom((current) => ({ ...current, [serviceId]: current[serviceId] || result.branches[0] || "" }));
+    } catch (reason) {
+      setError(errorText(reason));
+    }
+  }
+
+  useEffect(() => {
+    for (const address of catalog?.addresses ?? []) {
+      if (baselineMode[address.serviceId] === "create" && !remoteBranches[address.serviceId]) {
+        void loadRemoteBranches(address.serviceId);
+      }
+    }
+  }, [catalog, baselineMode, remoteBranches]);
+
   async function saveBaselines(event: FormEvent) {
     event.preventDefault();
     setError("");
     setOk("");
+    const addresses = catalog?.addresses ?? [];
+    for (const address of addresses) {
+      const name = (baselines[address.serviceId] ?? "").trim();
+      if (!name) {
+        setError(`请填写 ${address.name} 的分支`);
+        return;
+      }
+      if (baselineMode[address.serviceId] === "create" && !(baselineFrom[address.serviceId] ?? "").trim()) {
+        setError(`请选择 ${address.name} 的远端分支`);
+        return;
+      }
+    }
     try {
       await api(`/api/teams/${teamId}/workspaces`, {
         method: "PATCH",
         body: JSON.stringify({
-          items: Object.entries(baselines).map(([serviceId, baseline]) => ({ serviceId, baselineRef: baseline })),
+          items: addresses.map((address) => ({
+            serviceId: address.serviceId,
+            baselineRef: baselines[address.serviceId].trim(),
+            fromRemote: baselineMode[address.serviceId] === "create" ? baselineFrom[address.serviceId].trim() : undefined,
+          })),
         }),
       });
       setOk("基线已保存");
@@ -304,21 +350,68 @@ function Workspaces({ team, projectId, manager, onSaved }: { team: TeamItem; pro
     </div>
     <form className="card form" onSubmit={saveBaselines}>
       <h2>仓库地址</h2>
-      <p className="muted">这里是工作区里可直接分配的仓库。从群组勾选的仓库在保存 Agent 后也会出现在这里。</p>
+      <p className="muted">这里是工作区里可直接分配的仓库。可以填写远端已有分支，也可以从指定的远端分支创建一条只存在本机的分支。从群组勾选的仓库在保存 Agent 后也会出现在这里。</p>
       {(catalog?.addresses.length ?? 0) === 0 && <p className="muted">还没有仓库地址。</p>}
-      {catalog?.addresses.map((address) => (
-        <div className="address-row" key={address.serviceId}>
-          <label>{address.name}
-            <span className="meta">{address.repoUrl}</span>
-            <input
-              value={baselines[address.serviceId] ?? address.baselineRef}
-              onChange={(event) => setBaselines({ ...baselines, [address.serviceId]: event.target.value })}
-              disabled={!manager}
-            />
-          </label>
-          {manager && <button className="btn danger" type="button" onClick={() => setPendingDelete(address)}>删除</button>}
-        </div>
-      ))}
+      {catalog?.addresses.map((address) => {
+        const mode = baselineMode[address.serviceId] ?? "existing";
+        const branches = remoteBranches[address.serviceId] ?? [];
+        return (
+          <div className="address-row" key={address.serviceId}>
+            <div className="stack">
+              <div>
+                <strong>{address.name}</strong>
+                <div className="meta">{address.repoUrl}</div>
+              </div>
+              {manager && (
+                <div className="row">
+                  <button type="button" className={mode === "existing" ? "btn primary" : "btn"} onClick={() => {
+                    setBaselineMode({ ...baselineMode, [address.serviceId]: "existing" });
+                    if (!(baselines[address.serviceId] ?? "").trim()) setBaselines({ ...baselines, [address.serviceId]: address.baselineRef });
+                  }}>已有分支</button>
+                  <button type="button" className={mode === "create" ? "btn primary" : "btn"} onClick={() => {
+                    setBaselineMode({ ...baselineMode, [address.serviceId]: "create" });
+                    if (!address.baselineSource) setBaselines({ ...baselines, [address.serviceId]: "" });
+                    void loadRemoteBranches(address.serviceId);
+                  }}>从远端创建</button>
+                </div>
+              )}
+              {mode === "create" ? (
+                <>
+                  <label>远端分支
+                    <select
+                      value={baselineFrom[address.serviceId] ?? ""}
+                      onChange={(event) => setBaselineFrom({ ...baselineFrom, [address.serviceId]: event.target.value })}
+                      disabled={!manager}
+                    >
+                      {branches.length === 0 && <option value={baselineFrom[address.serviceId] ?? ""}>{baselineFrom[address.serviceId] || "正在读取远端分支"}</option>}
+                      {branches.map((branch) => <option key={branch} value={branch}>{branch}</option>)}
+                    </select>
+                  </label>
+                  <label>本地分支
+                    <input
+                      value={baselines[address.serviceId] ?? ""}
+                      onChange={(event) => setBaselines({ ...baselines, [address.serviceId]: event.target.value })}
+                      placeholder="新的本地分支名"
+                      disabled={!manager}
+                    />
+                  </label>
+                  <p className="muted">从所选远端分支创建，只保存在本机，不推送到远端。</p>
+                </>
+              ) : (
+                <label>已有分支
+                  <input
+                    value={baselines[address.serviceId] ?? address.baselineRef}
+                    onChange={(event) => setBaselines({ ...baselines, [address.serviceId]: event.target.value })}
+                    placeholder="填写远端已有分支"
+                    disabled={!manager}
+                  />
+                </label>
+              )}
+            </div>
+            {manager && <button className="btn danger" type="button" onClick={() => setPendingDelete(address)}>删除</button>}
+          </div>
+        );
+      })}
       {manager && (catalog?.addresses.length ?? 0) > 0 && <button className="btn primary">保存基线</button>}
     </form>
     {pendingDelete && (
