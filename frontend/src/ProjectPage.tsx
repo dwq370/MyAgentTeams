@@ -7,6 +7,7 @@ import {
   Project,
   TeamItem,
   KubernetesProbe,
+  SandboxInfo,
   SshProbeResult,
   TestEnvironment,
   token,
@@ -388,6 +389,10 @@ function environmentSummary(item: TestEnvironment) {
     const version = item.connectionInfo?.kind === "kubernetes" ? item.connectionInfo.kubernetesVersion : "";
     return `Kubernetes · ${item.kubeContext ?? ""} · ${item.clusterServer ?? ""} ${version}`.trim();
   }
+  if (item.kind === "sandbox") {
+    const info = item.connectionInfo?.kind === "sandbox" ? item.connectionInfo : null;
+    return `sandbox · ${info?.containerName ?? "本地"} · ${info?.status ?? "running"}`.trim();
+  }
   return `单机 · ${item.sshUsername ?? ""}@${item.sshHost ?? ""}:${item.sshPort ?? 22}`;
 }
 
@@ -395,7 +400,7 @@ function Environments({ projectId, manager, onChanged }: { projectId: string; ma
   const [items, setItems] = useState<TestEnvironment[]>([]);
   const [editing, setEditing] = useState<TestEnvironment | null>(null);
   const [name, setName] = useState("");
-  const [kind, setKind] = useState<"standalone" | "kubernetes">("standalone");
+  const [kind, setKind] = useState<"standalone" | "kubernetes" | "sandbox">("standalone");
   const [sshHost, setSshHost] = useState("");
   const [sshPort, setSshPort] = useState("22");
   const [sshUsername, setSshUsername] = useState("");
@@ -403,6 +408,9 @@ function Environments({ projectId, manager, onChanged }: { projectId: string; ma
   const [kubeContext, setKubeContext] = useState("");
   const [kubeProbe, setKubeProbe] = useState<KubernetesProbe | null>(null);
   const [sshProbe, setSshProbe] = useState<SshProbeResult | null>(null);
+  const [sandboxProbe, setSandboxProbe] = useState<SandboxInfo | null>(null);
+  const [probing, setProbing] = useState(false);
+  const probingLock = useRef(false);
   const [error, setError] = useState("");
 
   async function load() {
@@ -413,6 +421,20 @@ function Environments({ projectId, manager, onChanged }: { projectId: string; ma
   function resetConnection() {
     setKubeProbe(null);
     setSshProbe(null);
+    setSandboxProbe(null);
+  }
+
+  function savedSandboxName(item: TestEnvironment | null) {
+    return item?.connectionInfo?.kind === "sandbox" ? item.connectionInfo.containerName : undefined;
+  }
+
+  async function discardUnsavedSandbox(current = sandboxProbe) {
+    const name = current?.containerName;
+    if (!name || name === savedSandboxName(editing)) return;
+    await api(`/api/projects/${projectId}/environments/sandbox/discard`, {
+      method: "POST",
+      body: JSON.stringify({ containerName: name }),
+    }).catch(() => undefined);
   }
 
   function beginEdit(item: TestEnvironment) {
@@ -429,6 +451,7 @@ function Environments({ projectId, manager, onChanged }: { projectId: string; ma
   }
 
   function beginCreate() {
+    void discardUnsavedSandbox();
     setEditing(null);
     setName("");
     setKind("standalone");
@@ -443,6 +466,13 @@ function Environments({ projectId, manager, onChanged }: { projectId: string; ma
 
   function connectionBody() {
     if (kind === "kubernetes") return { kind, kubectlClient: "local" as const, kubeContext: kubeContext || undefined, environmentId: editing?.id };
+    if (kind === "sandbox") {
+      return {
+        kind,
+        containerName: sandboxProbe?.containerName ?? savedSandboxName(editing),
+        environmentId: editing?.id,
+      };
+    }
     return {
       kind,
       sshHost,
@@ -454,18 +484,27 @@ function Environments({ projectId, manager, onChanged }: { projectId: string; ma
   }
 
   async function probe() {
+    if (probingLock.current) return;
+    probingLock.current = true;
     setError("");
+    setProbing(true);
+    const body = connectionBody();
     resetConnection();
     try {
-      const result = await api<KubernetesProbe | SshProbeResult>(`/api/projects/${projectId}/environments/probe`, {
+      const result = await api<KubernetesProbe | SshProbeResult | SandboxInfo>(`/api/projects/${projectId}/environments/probe`, {
         method: "POST",
-        body: JSON.stringify(connectionBody()),
+        body: JSON.stringify(body),
       });
       if (result.kind === "kubernetes") {
         setKubeProbe(result);
         setKubeContext(result.context);
-      } else setSshProbe(result);
+      } else if (result.kind === "sandbox") setSandboxProbe(result);
+      else setSshProbe(result);
     } catch (reason) { setError(errorText(reason)); }
+    finally {
+      probingLock.current = false;
+      setProbing(false);
+    }
   }
 
   async function save(event: FormEvent) {
@@ -492,7 +531,7 @@ function Environments({ projectId, manager, onChanged }: { projectId: string; ma
     } catch (reason) { setError(errorText(reason)); }
   }
 
-  const confirmed = kind === "kubernetes" ? Boolean(kubeProbe) : Boolean(sshProbe);
+  const confirmed = kind === "kubernetes" ? Boolean(kubeProbe) : kind === "sandbox" ? Boolean(sandboxProbe) : Boolean(sshProbe);
   return (
     <div className="grid-2">
       <div className="stack">
@@ -522,9 +561,15 @@ function Environments({ projectId, manager, onChanged }: { projectId: string; ma
           </div>
           <label>名称<input value={name} onChange={(event) => setName(event.target.value)} required /></label>
           <label>类型
-            <select value={kind} onChange={(event) => { setKind(event.target.value as "standalone" | "kubernetes"); resetConnection(); }}>
+            <select value={kind} onChange={(event) => {
+              const next = event.target.value as "standalone" | "kubernetes" | "sandbox";
+              if (kind === "sandbox" && next !== "sandbox") void discardUnsavedSandbox();
+              setKind(next);
+              resetConnection();
+            }}>
               <option value="standalone">单机</option>
               <option value="kubernetes">Kubernetes 集群</option>
+              <option value="sandbox">sandbox</option>
             </select>
           </label>
           {kind === "kubernetes" ? (
@@ -541,7 +586,7 @@ function Environments({ projectId, manager, onChanged }: { projectId: string; ma
                   </select>
                 </label>
               )}
-              <button className="btn" type="button" onClick={() => void probe()}>检查集群</button>
+              <button className="btn" type="button" onClick={() => void probe()} disabled={probing}>{probing ? "正在检查" : "检查集群"}</button>
               {kubeProbe && (
                 <div className="stack">
                   <strong>请确认集群信息</strong>
@@ -554,13 +599,28 @@ function Environments({ projectId, manager, onChanged }: { projectId: string; ma
                 </div>
               )}
             </>
+          ) : kind === "sandbox" ? (
+            <>
+              <p className="muted">在本机 Docker 中创建一个 sandbox。容器会保持运行，供这个测试环境使用。</p>
+              <button className="btn" type="button" onClick={() => void probe()} disabled={probing}>
+                {probing ? "正在创建" : editing?.kind === "sandbox" ? "检查 sandbox" : "创建 sandbox"}
+              </button>
+              {sandboxProbe && (
+                <div className="stack">
+                  <strong>请确认本地 sandbox</strong>
+                  <p className="meta">容器 {sandboxProbe.containerName}</p>
+                  <p className="meta">镜像 {sandboxProbe.image}</p>
+                  <p className="meta">状态 {sandboxProbe.status}</p>
+                </div>
+              )}
+            </>
           ) : (
             <>
               <label>主机 IP<input value={sshHost} onChange={(event) => { setSshHost(event.target.value); resetConnection(); }} placeholder="192.168.1.10" required /></label>
               <label>端口<input value={sshPort} onChange={(event) => { setSshPort(event.target.value); resetConnection(); }} required /></label>
               <label>登录账号<input value={sshUsername} onChange={(event) => { setSshUsername(event.target.value); resetConnection(); }} required /></label>
               <label>登录密码<input type="password" value={sshPassword} onChange={(event) => { setSshPassword(event.target.value); resetConnection(); }} placeholder={editing?.passwordConfigured ? "留空则不修改" : ""} required={!editing?.passwordConfigured} /></label>
-              <button className="btn" type="button" onClick={() => void probe()}>测试连通性</button>
+              <button className="btn" type="button" onClick={() => void probe()} disabled={probing}>{probing ? "正在测试" : "测试连通性"}</button>
               {sshProbe && (
                 <div className="stack">
                   <strong>请确认主机连通性</strong>
@@ -572,7 +632,7 @@ function Environments({ projectId, manager, onChanged }: { projectId: string; ma
             </>
           )}
           {error && <div className="alert">{error}</div>}
-          <button className="btn primary" disabled={!confirmed}>确认并保存</button>
+          <button className="btn primary" disabled={!confirmed || probing}>确认并保存</button>
         </form>
       )}
     </div>

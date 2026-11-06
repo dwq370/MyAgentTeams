@@ -6,6 +6,7 @@ import {
   CreateProjectDto,
   CreateRoleDto,
   CreateTestEnvironmentDto,
+  DiscardSandboxDto,
   ProbeTestEnvironmentDto,
   GenerateArchitectureDto,
   UpdateProjectDto,
@@ -110,6 +111,15 @@ export class ProjectsController {
   @Get("projects/:projectId/environments")
   listEnvironments(@CurrentUser() user: AuthUser, @Param("projectId") projectId: string) {
     return this.projects.listEnvironments(user.id, projectId);
+  }
+
+  @Post("projects/:projectId/environments/sandbox/discard")
+  discardSandbox(
+    @CurrentUser() user: AuthUser,
+    @Param("projectId") projectId: string,
+    @Body() body: DiscardSandboxDto,
+  ) {
+    return this.projects.discardSandbox(user.id, projectId, body.containerName);
   }
 
   @Post("projects/:projectId/environments/probe")

@@ -48,6 +48,7 @@ services:
     volumes:
       - ${USERPROFILE}/.kube:/root/.kube:ro
       - repodata:/var/agentteam/repos
+      - /var/run/docker.sock:/var/run/docker.sock
     extra_hosts:
       - "host.docker.internal:host-gateway"
       - "kubernetes.docker.internal:host-gateway"

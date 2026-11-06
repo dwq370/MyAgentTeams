@@ -22,6 +22,7 @@ import {
 import { writeArchitectureFile } from "../platform/architecture-file";
 import { QueueService } from "../platform/queue.service";
 import { KubectlProbe } from "../platform/kubectl";
+import { LocalSandbox, sandboxContainerName } from "../platform/local-sandbox";
 import { SshProbe } from "../platform/ssh-probe";
 
 @Injectable()
@@ -33,6 +34,7 @@ export class ProjectsService {
     private readonly config: ConfigService,
     private readonly kubectl: KubectlProbe,
     private readonly ssh: SshProbe,
+    private readonly sandbox: LocalSandbox,
     private readonly queue: QueueService,
     @InjectRepository(ProjectEntity) private readonly projects: Repository<ProjectEntity>,
     @InjectRepository(ProjectMemberEntity) private readonly projectMembers: Repository<ProjectMemberEntity>,
@@ -319,41 +321,35 @@ export class ProjectsService {
   async probeEnvironment(
     userId: string,
     projectId: string,
-    input: {
-      kind: "standalone" | "kubernetes";
-      environmentId?: string;
-      sshHost?: string;
-      sshPort?: number;
-      sshUsername?: string;
-      sshPassword?: string;
-      kubectlClient?: "local";
-      kubeContext?: string;
-    },
+    input: EnvironmentConnection & { environmentId?: string },
   ) {
     await this.access.requireProject(userId, projectId, "admin");
     const existing = input.environmentId ? await this.loadEnvironment(projectId, input.environmentId) : null;
-    const checked = await this.checkConnection(input, existing);
+    const checked = await this.checkConnection(projectId, input, existing);
     return checked.info;
+  }
+
+  async discardSandbox(userId: string, projectId: string, containerName: string) {
+    await this.access.requireProject(userId, projectId, "admin");
+    const name = containerName.trim();
+    const used = await this.environments
+      .createQueryBuilder("env")
+      .where(`env.connection_info ->> 'containerName' = :name`, { name })
+      .getCount();
+    if (used > 0) return { ok: true };
+    await this.sandbox.removeIfOwned(projectId, name);
+    return { ok: true };
   }
 
   async createEnvironment(
     userId: string,
     projectId: string,
-    input: {
-      name: string;
-      kind: "standalone" | "kubernetes";
-      sshHost?: string;
-      sshPort?: number;
-      sshUsername?: string;
-      sshPassword?: string;
-      kubectlClient?: "local";
-      kubeContext?: string;
-    },
+    input: EnvironmentConnection & { name: string },
   ) {
     await this.access.requireProject(userId, projectId, "admin");
     const name = input.name.trim();
     await this.assertEnvironmentNameFree(projectId, name);
-    const checked = await this.checkConnection(input, null);
+    const checked = await this.checkConnection(projectId, input, null);
     const environment = await this.environments.save(this.environments.create({ projectId, name, deployEntry: "", ...checked.fields }));
     if (checked.passwordEncrypted !== undefined) {
       await this.environments.update(environment.id, { sshPasswordEncrypted: checked.passwordEncrypted });
@@ -365,16 +361,7 @@ export class ProjectsService {
     userId: string,
     projectId: string,
     environmentId: string,
-    input: {
-      name?: string;
-      kind?: "standalone" | "kubernetes";
-      sshHost?: string;
-      sshPort?: number;
-      sshUsername?: string;
-      sshPassword?: string;
-      kubectlClient?: "local";
-      kubeContext?: string;
-    },
+    input: Partial<EnvironmentConnection> & { name?: string },
   ) {
     await this.access.requireProject(userId, projectId, "admin");
     const environment = await this.loadEnvironment(projectId, environmentId);
@@ -383,7 +370,9 @@ export class ProjectsService {
       environment.name = input.name.trim();
     }
     const kind = input.kind ?? environment.kind;
+    const previousSandbox = environment.kind === "sandbox" ? sandboxContainerName(environment.connectionInfo) : null;
     const checked = await this.checkConnection(
+      projectId,
       {
         kind,
         sshHost: input.sshHost ?? environment.sshHost ?? undefined,
@@ -392,12 +381,15 @@ export class ProjectsService {
         sshPassword: input.sshPassword,
         kubectlClient: kind === "kubernetes" ? "local" : undefined,
         kubeContext: input.kubeContext ?? environment.kubeContext ?? undefined,
+        containerName: input.containerName ?? (kind === "sandbox" ? previousSandbox ?? undefined : undefined),
       },
       environment,
     );
     Object.assign(environment, checked.fields);
     await this.environments.save(environment);
     await this.environments.update(environment.id, { sshPasswordEncrypted: checked.passwordEncrypted ?? null });
+    const nextSandbox = checked.fields.kind === "sandbox" ? sandboxContainerName(checked.fields.connectionInfo) : null;
+    if (previousSandbox && previousSandbox !== nextSandbox) await this.sandbox.remove(previousSandbox);
     return this.presentEnvironment({ ...environment, sshPasswordEncrypted: checked.passwordEncrypted ?? null });
   }
 
@@ -411,6 +403,7 @@ export class ProjectsService {
         teams: teams.map((team) => ({ id: team.id, name: team.name })),
       });
     }
+    if (environment.kind === "sandbox") await this.sandbox.remove(sandboxContainerName(environment.connectionInfo));
     await this.environments.delete({ id: environmentId });
     return { ok: true };
   }
@@ -550,17 +543,27 @@ export class ProjectsService {
   }
 
   private async checkConnection(
-    input: {
-      kind: "standalone" | "kubernetes";
-      sshHost?: string;
-      sshPort?: number;
-      sshUsername?: string;
-      sshPassword?: string;
-      kubectlClient?: "local";
-      kubeContext?: string;
-    },
+    projectId: string,
+    input: EnvironmentConnection,
     existing: TestEnvironmentEntity | null,
   ) {
+    if (input.kind === "sandbox") {
+      const info = await this.sandbox.ensure(projectId, input.containerName);
+      return {
+        info,
+        passwordEncrypted: null,
+        fields: {
+          kind: "sandbox" as const,
+          url: null,
+          sshHost: null,
+          sshPort: null,
+          sshUsername: null,
+          kubeContext: null,
+          clusterServer: null,
+          connectionInfo: info as unknown as Record<string, unknown>,
+        },
+      };
+    }
     if (input.kind === "kubernetes") {
       if (input.kubectlClient && input.kubectlClient !== "local") throw new DomainError("请选择本地 kubectl 客户端");
       const info = await this.kubectl.inspect(input.kubeContext);
@@ -625,4 +628,17 @@ export class ProjectsService {
   private encryptionKey() {
     return this.config.getOrThrow<string>("APP_ENCRYPTION_KEY");
   }
+}
+
+type EnvironmentKind = "standalone" | "kubernetes" | "sandbox";
+
+interface EnvironmentConnection {
+  kind: EnvironmentKind;
+  sshHost?: string;
+  sshPort?: number;
+  sshUsername?: string;
+  sshPassword?: string;
+  kubectlClient?: "local";
+  kubeContext?: string;
+  containerName?: string;
 }

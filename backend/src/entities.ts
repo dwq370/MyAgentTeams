@@ -180,7 +180,7 @@ export class TestEnvironmentEntity {
   name: string;
 
   @Column({ default: "standalone" })
-  kind: "standalone" | "kubernetes";
+  kind: "standalone" | "kubernetes" | "sandbox";
 
   @Column({ type: "text", nullable: true })
   url: string | null;

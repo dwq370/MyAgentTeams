@@ -88,8 +88,8 @@ export class BindAgentEngineDto {
 }
 
 export class ProbeTestEnvironmentDto {
-  @IsIn(["standalone", "kubernetes"])
-  kind: "standalone" | "kubernetes";
+  @IsIn(["standalone", "kubernetes", "sandbox"])
+  kind: "standalone" | "kubernetes" | "sandbox";
 
   @IsOptional()
   @IsUUID()
@@ -130,6 +130,12 @@ export class ProbeTestEnvironmentDto {
   @IsString()
   @MaxLength(200)
   kubeContext?: string;
+
+  @ValidateIf((item: ProbeTestEnvironmentDto) => item.kind === "sandbox")
+  @IsOptional()
+  @IsString()
+  @MaxLength(40)
+  containerName?: string;
 }
 
 export class CreateTestEnvironmentDto extends ProbeTestEnvironmentDto {
@@ -147,8 +153,8 @@ export class UpdateTestEnvironmentDto {
   name?: string;
 
   @IsOptional()
-  @IsIn(["standalone", "kubernetes"])
-  kind?: "standalone" | "kubernetes";
+  @IsIn(["standalone", "kubernetes", "sandbox"])
+  kind?: "standalone" | "kubernetes" | "sandbox";
 
   @IsOptional()
   @IsString()
@@ -180,6 +186,18 @@ export class UpdateTestEnvironmentDto {
   @IsString()
   @MaxLength(200)
   kubeContext?: string;
+
+  @IsOptional()
+  @IsString()
+  @MaxLength(40)
+  containerName?: string;
+}
+
+export class DiscardSandboxDto {
+  @IsString()
+  @MinLength(1)
+  @MaxLength(40)
+  containerName: string;
 }
 
 export class CreateRoleDto {

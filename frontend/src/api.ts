@@ -113,10 +113,19 @@ export interface SshProbeResult {
   output: string;
 }
 
+export interface SandboxInfo {
+  kind: "sandbox";
+  runtime: "local";
+  containerName: string;
+  containerId: string;
+  image: string;
+  status: string;
+}
+
 export interface TestEnvironment {
   id: string;
   name: string;
-  kind: "standalone" | "kubernetes";
+  kind: "standalone" | "kubernetes" | "sandbox";
   url: string | null;
   deployEntry: string;
   sshHost: string | null;
@@ -125,7 +134,7 @@ export interface TestEnvironment {
   passwordConfigured?: boolean;
   kubeContext: string | null;
   clusterServer: string | null;
-  connectionInfo: KubernetesProbe | SshProbeResult | null;
+  connectionInfo: KubernetesProbe | SshProbeResult | SandboxInfo | null;
 }
 
 export interface RoleItem {

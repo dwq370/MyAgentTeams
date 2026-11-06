@@ -108,6 +108,10 @@ export function TeamPage() {
 
 function environmentSummary(item: TestEnvironment) {
   if (item.kind === "kubernetes") return `Kubernetes · ${item.kubeContext ?? ""} · ${item.clusterServer ?? ""}`;
+  if (item.kind === "sandbox") {
+    const info = item.connectionInfo?.kind === "sandbox" ? item.connectionInfo : null;
+    return `sandbox · ${info?.containerName ?? "本地"} · ${info?.image ?? ""}`.trim();
+  }
   return `单机 · ${item.sshUsername ?? ""}@${item.sshHost ?? ""}:${item.sshPort ?? 22}`;
 }
 
